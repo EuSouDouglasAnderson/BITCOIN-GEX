@@ -145,7 +145,7 @@ def buscar_historico(limite=100):
         """
         SELECT
             id, side, entry_time, entry_price, stop_price, target_price,
-            exit_time, exit_price, pnl_pct, result, score, regime,
+            exit_time, exit_price, pnl_pct, result, exit_reason, score, regime,
             signal_time, signal, entry_reason
         FROM trades
         ORDER BY id DESC
