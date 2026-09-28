@@ -65,6 +65,7 @@ def criar_banco():
             exit_price REAL,
             pnl_pct REAL,
             result TEXT,
+            exit_reason TEXT,
             score REAL,
             regime TEXT,
             notes TEXT,
@@ -94,6 +95,11 @@ def criar_banco():
         )
         """
     )
+    # Compatibilidade caso o banco v2 já tenha sido criado antes desta atualização.
+    colunas = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+    if "exit_reason" not in colunas:
+        conn.execute("ALTER TABLE trades ADD COLUMN exit_reason TEXT")
+
     conn.commit()
     conn.close()
 
@@ -119,7 +125,7 @@ def buscar_operacoes_abertas():
         """
         SELECT
             id, symbol, side, entry_time, entry_price, stop_price, target_price,
-            exit_time, exit_price, pnl_pct, result, score, regime, notes,
+            exit_time, exit_price, pnl_pct, result, exit_reason, score, regime, notes,
             signal_time, ema20, ema50, ema200, rsi, atr, ret_1, ret_3, ret_12,
             ret_48, volatility, vol_z, volume_ratio, volume_z, vwap, cvd_delta,
             orderbook_imbalance, score_compra, score_venda, signal, entry_reason
@@ -269,7 +275,7 @@ def registrar_trade(
     return trade_id
 
 
-def fechar_trade(trade_id, exit_price, result):
+def fechar_trade(trade_id, exit_price, exit_reason):
     conn = get_conn()
     row = conn.execute(
         "SELECT side, entry_price FROM trades WHERE id = ?",
@@ -289,13 +295,20 @@ def fechar_trade(trade_id, exit_price, result):
     else:
         pnl_pct = ((entry_price / exit_price) - 1) * 100
 
+    if pnl_pct > 0:
+        result = "GANHO"
+    elif pnl_pct < 0:
+        result = "PERDA"
+    else:
+        result = "EMPATE"
+
     conn.execute(
         """
         UPDATE trades
-        SET exit_time = ?, exit_price = ?, pnl_pct = ?, result = ?
+        SET exit_time = ?, exit_price = ?, pnl_pct = ?, result = ?, exit_reason = ?
         WHERE id = ?
         """,
-        (agora(), exit_price, pnl_pct, result, int(trade_id)),
+        (agora(), exit_price, pnl_pct, result, exit_reason, int(trade_id)),
     )
     conn.commit()
     conn.close()
@@ -315,25 +328,26 @@ def monitorar_operacoes(preco_atual, tempo_maximo):
         entry_time = pd.to_datetime(trade["entry_time"])
         minutos_aberto = (agora_dt - entry_time.to_pydatetime()).total_seconds() / 60
 
-        resultado = None
+        exit_reason = None
 
         if side == "COMPRA":
             if preco_atual <= float(trade["stop_price"]):
-                resultado = "PERDA"
+                exit_reason = "STOP"
             elif preco_atual >= float(trade["target_price"]):
-                resultado = "GANHO"
+                exit_reason = "ALVO"
         elif side == "VENDA":
             if preco_atual >= float(trade["stop_price"]):
-                resultado = "PERDA"
+                exit_reason = "STOP"
             elif preco_atual <= float(trade["target_price"]):
-                resultado = "GANHO"
+                exit_reason = "ALVO"
 
-        if resultado is None and minutos_aberto >= tempo_maximo:
-            resultado = "TIMEOUT"
+        if exit_reason is None and minutos_aberto >= tempo_maximo:
+            exit_reason = "TIMEOUT"
 
-        if resultado:
-            fechar_trade(trade_id, preco_atual, resultado)
-            fechadas.append((trade_id, resultado))
+        if exit_reason:
+            fechar_trade(trade_id, preco_atual, exit_reason)
+            # O resultado GANHO/PERDA é calculado pelo P&L real no fechamento.
+            fechadas.append((trade_id, exit_reason))
 
     return fechadas
 
@@ -574,6 +588,49 @@ def calcular_plano(side, preco, atr):
     return stop, target
 
 # ============================================================
+# SIMULAÇÃO DE BANCA
+# ============================================================
+def simular_banca(historico, banca_inicial, percentual_entrada):
+    if historico.empty:
+        return pd.DataFrame(), float(banca_inicial)
+
+    df = historico.copy()
+    df = df[df["pnl_pct"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(), float(banca_inicial)
+
+    df["entry_time_sort"] = pd.to_datetime(df["entry_time"], errors="coerce")
+    df = df.sort_values(["entry_time_sort", "id"]).reset_index(drop=True)
+
+    banca = float(banca_inicial)
+    registros = []
+    taxa = float(percentual_entrada) / 100.0
+
+    for _, trade in df.iterrows():
+        banca_antes = banca
+        valor_entrada = banca_antes * taxa
+        pnl_pct = float(trade["pnl_pct"])
+        resultado_rs = valor_entrada * (pnl_pct / 100.0)
+        banca = banca_antes + resultado_rs
+
+        registros.append({
+            "#": int(trade["id"]),
+            "Lado": trade["side"],
+            "Entrada": trade["entry_time"],
+            "Saída": trade["exit_time"],
+            "P&L mercado %": pnl_pct,
+            "Banca antes": banca_antes,
+            "Entrada 1%": valor_entrada,
+            "Resultado R$": resultado_rs,
+            "Banca depois": banca,
+            "Resultado": trade["result"] if pd.notna(trade["result"]) else ("GANHO" if pnl_pct > 0 else "PERDA" if pnl_pct < 0 else "EMPATE"),
+            "Saída por": trade["exit_reason"] if pd.notna(trade.get("exit_reason")) else "-",
+        })
+
+    return pd.DataFrame(registros), banca
+
+
+# ============================================================
 # INTERFACE
 # ============================================================
 st.title("₿ BTC Quant Trader — Paper Trading v2")
@@ -597,6 +654,19 @@ with st.sidebar:
         max_value=1440,
         value=60,
         step=5,
+    )
+    banca_inicial = st.number_input(
+        "Banca inicial da simulação (R$)",
+        min_value=1.0,
+        value=1000.0,
+        step=100.0,
+    )
+    percentual_entrada = st.number_input(
+        "Entrada por operação (% da banca)",
+        min_value=0.1,
+        max_value=100.0,
+        value=1.0,
+        step=0.1,
     )
     st.divider()
     st.write(f"**Stop:** {ATR_STOP_MULTIPLIER:.1f} × ATR")
@@ -825,15 +895,17 @@ def monitor():
                     "exit_price": "Preço saída",
                     "pnl_pct": "P&L %",
                     "result": "Resultado",
+                    "exit_reason": "Saída por",
                     "score": "Score",
                     "regime": "Regime",
                     "signal": "Sinal",
                 }
             )
-            if "P&L %" in hist:
-                hist["P&L %"] = hist["P&L %"].map(
-                    lambda x: "-" if pd.isna(x) else f"{x:+.2f}%"
-                )
+            hist["Resultado"] = hist["Resultado"].fillna("ABERTA")
+            hist["Saída por"] = hist["Saída por"].fillna("-")
+            hist["P&L %"] = hist["P&L %"].map(
+                lambda x: "-" if pd.isna(x) else f"{x:+.2f}%"
+            )
             for col in ["Preço entrada", "Stop", "Alvo", "Preço saída"]:
                 if col in hist.columns:
                     hist[col] = hist[col].map(
@@ -842,13 +914,56 @@ def monitor():
 
             hist_cols = [
                 "#", "Lado", "Entrada", "Preço entrada", "Stop", "Alvo",
-                "Saída", "Preço saída", "P&L %", "Resultado", "Score", "Regime", "Sinal",
+                "Saída", "Preço saída", "P&L %", "Resultado", "Saída por",
+                "Score", "Regime", "Sinal",
             ]
             st.dataframe(hist[hist_cols], use_container_width=True, hide_index=True)
+
+            # Simulação de banca: 1% da banca em cada operação.
+            sim, banca_final = simular_banca(historico, banca_inicial, percentual_entrada)
+            st.markdown("### 💰 Simulação da banca")
+            st.caption(
+                f"Banca inicial: R$ {banca_inicial:,.2f} • "
+                f"Entrada: {percentual_entrada:.1f}% da banca em cada operação • "
+                "O lucro/prejuízo da operação é aplicado proporcionalmente ao valor da entrada."
+            )
+
+            if sim.empty:
+                st.info("A simulação aparecerá quando houver pelo menos uma operação fechada.")
+            else:
+                ganhos_sim = int((sim["Resultado"] == "GANHO").sum())
+                perdas_sim = int((sim["Resultado"] == "PERDA").sum())
+                banca_inicial_sim = float(banca_inicial)
+                lucro_total_rs = banca_final - banca_inicial_sim
+                retorno_banca = (banca_final / banca_inicial_sim - 1) * 100 if banca_inicial_sim else 0
+
+                b1, b2, b3, b4 = st.columns(4)
+                b1.metric("Banca atual", f"R$ {banca_final:,.2f}")
+                b2.metric("Lucro / prejuízo", f"R$ {lucro_total_rs:+,.2f}")
+                b3.metric("Retorno da banca", f"{retorno_banca:+.2f}%")
+                b4.metric("Ganhas / Perdidas", f"{ganhos_sim} / {perdas_sim}")
+
+                sim_exib = sim.copy()
+                sim_exib["P&L mercado %"] = sim_exib["P&L mercado %"].map(lambda x: f"{x:+.2f}%")
+                for col in ["Banca antes", "Entrada 1%", "Resultado R$", "Banca depois"]:
+                    sim_exib[col] = sim_exib[col].map(lambda x: f"R$ {x:,.2f}")
+                sim_exib["Resultado"] = sim_exib["Resultado"].fillna("-")
+                st.dataframe(
+                    sim_exib[[
+                        "#", "Lado", "Entrada", "Saída", "P&L mercado %",
+                        "Banca antes", "Entrada 1%", "Resultado R$",
+                        "Banca depois", "Resultado", "Saída por",
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
             ultimo = historico.iloc[0]
             with st.expander("📋 Motivo da última operação registrada"):
                 st.write(f"**Operação #{int(ultimo['id'])} — {ultimo['side']}**")
+                st.write(f"**Resultado:** {ultimo['result'] if pd.notna(ultimo['result']) else 'ABERTA'}")
+                if pd.notna(ultimo.get("exit_reason")):
+                    st.write(f"**Saída por:** {ultimo['exit_reason']}")
                 st.code(str(ultimo["entry_reason"]), language="text")
 
         # --------------------------------------------------------
