@@ -1,4 +1,5 @@
 import sqlite3
+import math
 from datetime import datetime, timedelta, timezone
 import uuid
 
@@ -557,14 +558,30 @@ def estrategia_e_signal(sinal_tecnico, ratio_data):
 # ============================================================
 @st.cache_data(ttl=30, show_spinner=False)
 def buscar_opcoes_deribit():
-    """Busca resumo + metadados dos contratos de opção BTC na Deribit."""
+    """
+    Busca opções BTC na Deribit usando os endpoints públicos.
+
+    Importante: get_book_summary_by_currency normalmente fornece OI e mark_iv,
+    mas não precisa fornecer o campo `greeks`. Por isso, o GEX desta versão
+    calcula o gamma de Black-Scholes a partir de:
+        - open_interest
+        - mark_iv
+        - strike
+        - expiration_timestamp
+        - preço spot do BTC
+
+    Assim não dependemos de um campo `greeks` que pode não vir no summary.
+    """
     r_summary = requests.get(
         f"{DERIBIT_API}/public/get_book_summary_by_currency",
         params={"currency": "BTC", "kind": "option"},
         timeout=15,
     )
     r_summary.raise_for_status()
-    summary = r_summary.json().get("result", [])
+    payload = r_summary.json()
+    if "error" in payload:
+        raise RuntimeError(f"Deribit summary: {payload['error'].get('message', payload['error'])}")
+    summary = payload.get("result", [])
     if not summary:
         raise RuntimeError("Deribit não retornou resumo de opções BTC.")
 
@@ -574,36 +591,78 @@ def buscar_opcoes_deribit():
         timeout=15,
     )
     r_instruments.raise_for_status()
-    instruments = r_instruments.json().get("result", [])
+    payload_i = r_instruments.json()
+    if "error" in payload_i:
+        raise RuntimeError(f"Deribit instruments: {payload_i['error'].get('message', payload_i['error'])}")
+    instruments = payload_i.get("result", [])
 
     metadata = {item.get("instrument_name"): item for item in instruments}
     resultado = []
     for item in summary:
         nome = item.get("instrument_name")
+        if not nome:
+            continue
         meta = metadata.get(nome, {})
         combinado = dict(meta)
         combinado.update(item)
         resultado.append(combinado)
+
+    if not resultado:
+        raise RuntimeError("Deribit retornou opções, mas nenhum instrumento pôde ser associado.")
+
     return resultado
+
+
+def _normalizar_iv(mark_iv):
+    """Converte IV da Deribit para decimal anual."""
+    try:
+        iv = float(mark_iv)
+    except (TypeError, ValueError):
+        return np.nan
+    if not np.isfinite(iv) or iv <= 0:
+        return np.nan
+    # A API pode representar IV em pontos percentuais (ex.: 65.0).
+    # Se vier como decimal (ex.: 0.65), preservamos.
+    return iv / 100.0 if iv > 3.0 else iv
+
+
+def _gamma_black_scholes(spot, strike, iv, t_years):
+    """Gamma aproximado de Black-Scholes para uma opção europeia."""
+    if not all(np.isfinite([spot, strike, iv, t_years])):
+        return np.nan
+    if spot <= 0 or strike <= 0 or iv <= 0 or t_years <= 0:
+        return np.nan
+    try:
+        sigma_sqrt_t = iv * math.sqrt(t_years)
+        d1 = (
+            math.log(spot / strike)
+            + 0.5 * iv * iv * t_years
+        ) / sigma_sqrt_t
+        pdf = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
+        return pdf / (spot * sigma_sqrt_t)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return np.nan
 
 
 def calcular_gex_proxy(opcoes, preco_btc):
     """
-    Calcula uma proxy normalizada de GEX.
+    Calcula uma proxy normalizada de GEX usando OI + IV + Black-Scholes gamma.
 
-    Assunção explícita: calls contribuem positivamente e puts negativamente,
-    ponderadas por OI * gamma. Isso NÃO observa a posição real dos dealers;
-    serve como variável de regime/pesquisa.
+    Assunção explícita: calls contribuem positivamente e puts negativamente.
+    Isso NÃO observa a posição real dos dealers; é uma variável de regime/pesquisa.
+
+    A principal correção em relação à versão anterior é que não exigimos mais
+    `greeks.gamma` no retorno da Deribit. O gamma é calculado a partir do mark_iv.
     """
     agora_utc = datetime.now(timezone.utc)
     registros = []
+    spot = float(preco_btc)
 
     for item in opcoes:
         nome = item.get("instrument_name", "")
         if not nome:
             continue
 
-        # O nome normalmente termina em -C ou -P; usamos também option_type quando disponível.
         tipo = str(item.get("option_type", "")).lower()
         if tipo not in ("call", "put"):
             if nome.endswith("-C"):
@@ -616,48 +675,60 @@ def calcular_gex_proxy(opcoes, preco_btc):
         try:
             strike = float(item.get("strike"))
         except (TypeError, ValueError):
-            # Algumas respostas podem não carregar strike diretamente.
             try:
                 partes = nome.split("-")
                 strike = float(partes[-2])
             except Exception:
                 continue
 
-        oi = item.get("open_interest")
-        gamma = (item.get("greeks") or {}).get("gamma")
-        if gamma is None:
-            gamma = item.get("gamma")
-
         try:
-            oi = float(oi)
-            gamma = float(gamma)
+            oi = float(item.get("open_interest"))
         except (TypeError, ValueError):
             continue
-        if not np.isfinite(oi) or not np.isfinite(gamma) or oi <= 0 or gamma <= 0:
+        if not np.isfinite(oi) or oi <= 0:
             continue
 
         exp_ms = item.get("expiration_timestamp")
         if exp_ms is None:
-            # Alguns endpoints podem usar expiration_timestamp no instrumento.
             continue
         try:
             expiry = datetime.fromtimestamp(float(exp_ms) / 1000, tz=timezone.utc)
         except Exception:
             continue
 
-        dte_hours = (expiry - agora_utc).total_seconds() / 3600
+        dte_hours = (expiry - agora_utc).total_seconds() / 3600.0
         if dte_hours < -1:
             continue
 
-        # Proxy de exposição: OI * gamma * S^2. Escala 0.01 apenas para leitura.
-        bruto = oi * gamma * (preco_btc ** 2) * 0.01
+        iv = _normalizar_iv(item.get("mark_iv"))
+        if not np.isfinite(iv):
+            continue
+
+        t_years = max(dte_hours, 0.01) / (24.0 * 365.0)
+        gamma = _gamma_black_scholes(spot, strike, iv, t_years)
+        if not np.isfinite(gamma) or gamma <= 0:
+            continue
+
+        # Contract size vem dos metadados quando disponível. Para a proxy,
+        # usamos 1.0 como fallback para não descartar a opção.
+        try:
+            contract_size = float(item.get("contract_size", 1.0))
+        except (TypeError, ValueError):
+            contract_size = 1.0
+        if not np.isfinite(contract_size) or contract_size <= 0:
+            contract_size = 1.0
+
+        # Proxy de exposição. O fator 0.01 só reduz a escala visual.
+        bruto = oi * contract_size * gamma * (spot ** 2) * 0.01
         assinado = bruto if tipo == "call" else -bruto
+
         registros.append(
             {
                 "instrument_name": nome,
                 "type": tipo,
                 "strike": strike,
                 "oi": oi,
+                "iv": iv,
                 "gamma": gamma,
                 "expiry": expiry,
                 "dte_hours": dte_hours,
@@ -666,7 +737,9 @@ def calcular_gex_proxy(opcoes, preco_btc):
         )
 
     if not registros:
-        raise RuntimeError("Não foi possível obter gamma/OI utilizáveis da Deribit.")
+        raise RuntimeError(
+            "Deribit retornou opções, mas não encontrei opções com OI + mark_iv + strike + expiração válidos para calcular gamma."
+        )
 
     df = pd.DataFrame(registros)
     expiries = sorted(df["expiry"].unique())
@@ -678,39 +751,28 @@ def calcular_gex_proxy(opcoes, preco_btc):
     gex_proxy = float(df["gex"].sum())
 
     # ATM OI na expiração mais próxima: strikes dentro de ±1% do spot.
-    atm_mask = (nearest["strike"] / preco_btc - 1).abs() <= D_ATM_BAND_PCT
+    atm_mask = (nearest["strike"] / spot - 1).abs() <= D_ATM_BAND_PCT
     atm_oi = float(nearest.loc[atm_mask, "oi"].sum())
     atm_oi_total = float(nearest["oi"].sum())
     atm_oi_ratio = atm_oi / atm_oi_total if atm_oi_total > 0 else 0.0
 
-    # "Elevado" é relativo às expirações disponíveis, usando o mesmo critério ATM.
+    # Elevado é relativo às expirações disponíveis.
     atm_por_exp = []
-    for expiry, grupo in df.groupby("expiry"):
-        mask = (grupo["strike"] / preco_btc - 1).abs() <= D_ATM_BAND_PCT
+    for _, grupo in df.groupby("expiry"):
+        mask = (grupo["strike"] / spot - 1).abs() <= D_ATM_BAND_PCT
         atm_por_exp.append(float(grupo.loc[mask, "oi"].sum()))
     threshold = float(np.percentile(atm_por_exp, D_ATM_ELEVATED_PERCENTILE)) if atm_por_exp else 0.0
     atm_elevado = atm_oi >= threshold and atm_oi > 0
 
-    dte_hours = float((nearest_expiry - agora_utc).total_seconds() / 3600)
+    dte_hours = float((nearest_expiry - agora_utc).total_seconds() / 3600.0)
     gex_negativo = gex_proxy < D_GEX_NEGATIVE_THRESHOLD
     dentro_janela = dte_hours <= D_MAX_DTE_HOURS
 
-    condicoes = []
-    if gex_negativo:
-        condicoes.append("GEX negativo")
-    else:
-        condicoes.append("GEX não negativo")
-    if atm_elevado:
-        condicoes.append("OI ATM elevado")
-    else:
-        condicoes.append("OI ATM não elevado")
-    if dentro_janela:
-        condicoes.append("expiração <= 24h")
-    else:
-        condicoes.append("expiração > 24h")
+    condicoes = ["GEX negativo" if gex_negativo else "GEX não negativo"]
+    condicoes.append("OI ATM elevado" if atm_elevado else "OI ATM não elevado")
+    condicoes.append("expiração <= 24h" if dentro_janela else "expiração > 24h")
 
     d_ativa = bool(gex_negativo and atm_elevado and dentro_janela)
-    gex_condition = "D ATIVA" if d_ativa else "D INATIVA"
 
     return {
         "gex_proxy": gex_proxy,
@@ -726,8 +788,10 @@ def calcular_gex_proxy(opcoes, preco_btc):
         "gex_negativo": gex_negativo,
         "dentro_janela": dentro_janela,
         "d_ativa": d_ativa,
-        "gex_condition": gex_condition,
+        "gex_condition": "D ATIVA" if d_ativa else "D INATIVA",
         "condicoes": condicoes,
+        "options_used": len(df),
+        "gex_method": "OI + mark_iv + Black-Scholes gamma",
     }
 
 # ============================================================
@@ -1194,6 +1258,7 @@ def monitor():
                 st.write(f"**Próxima expiração:** {gex_data['nearest_expiry']}")
                 st.write(f"**OI ATM ratio:** {gex_data['atm_oi_ratio']:.2%}")
                 st.write(f"**Percentil usado para OI elevado:** {D_ATM_ELEVATED_PERCENTILE:.0f}%")
+                st.write(f"**Opções utilizadas:** {gex_data.get('options_used', '-')} | **Método:** {gex_data.get('gex_method', '-')}")
                 st.write("**Condições:** " + " | ".join(gex_data["condicoes"]))
                 if gex_data["d_ativa"]:
                     st.success("🟢 Estratégia D ATIVA")
@@ -1272,6 +1337,8 @@ def monitor():
                     "nearest_expiry": gex_data["nearest_expiry"],
                     "dte_hours": gex_data["dte_hours"],
                     "D_ativa": gex_data["d_ativa"],
+                    "gex_options_used": gex_data.get("options_used"),
+                    "gex_method": gex_data.get("gex_method"),
                 })
             if ratio_data:
                 audit.update({
