@@ -16,9 +16,10 @@ BINANCE_API = "https://data-api.binance.vision"
 SYMBOL = "BTCUSDT"
 DATABASE = "btc_trader.db"
 
+AUTO_REFRESH_SECONDS = 10
 
 st.set_page_config(
-    page_title="BTC Quant Trader",
+    page_title="BTC Quant Trader V2",
     page_icon="₿",
     layout="wide"
 )
@@ -42,32 +43,48 @@ def criar_banco():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
 
             symbol TEXT,
-
             side TEXT,
 
             entry_time TEXT,
-
             entry_price REAL,
 
             stop_price REAL,
-
             target_price REAL,
 
             exit_time TEXT,
-
             exit_price REAL,
 
             pnl_pct REAL,
-
             result TEXT,
 
             score REAL,
-
             regime TEXT,
 
-            notes TEXT
+            notes TEXT,
+
+            signal_time TEXT
         )
     """)
+
+    conn.commit()
+
+    # --------------------------------------------------------
+    # MIGRAÇÃO DO BANCO ANTIGO
+    # --------------------------------------------------------
+
+    colunas = [
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(trades)"
+        ).fetchall()
+    ]
+
+    if "signal_time" not in colunas:
+
+        conn.execute("""
+            ALTER TABLE trades
+            ADD COLUMN signal_time TEXT
+        """)
 
     conn.commit()
     conn.close()
@@ -80,7 +97,27 @@ criar_banco()
 # API BINANCE
 # ============================================================
 
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=5)
+def buscar_preco():
+
+    url = f"{BINANCE_API}/api/v3/ticker/price"
+
+    resposta = requests.get(
+        url,
+        params={
+            "symbol": SYMBOL
+        },
+        timeout=10
+    )
+
+    resposta.raise_for_status()
+
+    return float(
+        resposta.json()["price"]
+    )
+
+
+@st.cache_data(ttl=10)
 def buscar_candles(
     symbol="BTCUSDT",
     interval="5m",
@@ -159,26 +196,6 @@ def buscar_candles(
 
 
 @st.cache_data(ttl=5)
-def buscar_preco():
-
-    url = f"{BINANCE_API}/api/v3/ticker/price"
-
-    resposta = requests.get(
-        url,
-        params={
-            "symbol": SYMBOL
-        },
-        timeout=10
-    )
-
-    resposta.raise_for_status()
-
-    return float(
-        resposta.json()["price"]
-    )
-
-
-@st.cache_data(ttl=5)
 def buscar_orderbook():
 
     url = f"{BINANCE_API}/api/v3/depth"
@@ -217,29 +234,36 @@ def calcular_indicadores(df):
 
     df["ret_48"] = df["close"].pct_change(48)
 
-
     # --------------------------------------------------------
-    # MÉDIAS
+    # EMA
     # --------------------------------------------------------
 
     df["ema20"] = (
         df["close"]
-        .ewm(span=20, adjust=False)
+        .ewm(
+            span=20,
+            adjust=False
+        )
         .mean()
     )
 
     df["ema50"] = (
         df["close"]
-        .ewm(span=50, adjust=False)
+        .ewm(
+            span=50,
+            adjust=False
+        )
         .mean()
     )
 
     df["ema200"] = (
         df["close"]
-        .ewm(span=200, adjust=False)
+        .ewm(
+            span=200,
+            adjust=False
+        )
         .mean()
     )
-
 
     # --------------------------------------------------------
     # RSI
@@ -275,7 +299,10 @@ def calcular_indicadores(df):
 
     rs = (
         avg_gain /
-        avg_loss.replace(0, np.nan)
+        avg_loss.replace(
+            0,
+            np.nan
+        )
     )
 
     df["rsi"] = (
@@ -288,12 +315,13 @@ def calcular_indicadores(df):
 
     df["rsi"] = df["rsi"].fillna(50)
 
-
     # --------------------------------------------------------
     # ATR
     # --------------------------------------------------------
 
-    fechamento_anterior = df["close"].shift(1)
+    fechamento_anterior = (
+        df["close"].shift(1)
+    )
 
     tr = pd.concat(
         [
@@ -317,7 +345,6 @@ def calcular_indicadores(df):
         .rolling(14)
         .mean()
     )
-
 
     # --------------------------------------------------------
     # VOLATILIDADE
@@ -347,9 +374,11 @@ def calcular_indicadores(df):
             media_vol
         )
         /
-        desvio_vol.replace(0, np.nan)
+        desvio_vol.replace(
+            0,
+            np.nan
+        )
     )
-
 
     # --------------------------------------------------------
     # VOLUME
@@ -369,7 +398,10 @@ def calcular_indicadores(df):
 
     df["volume_ratio"] = (
         df["volume"] /
-        media_volume.replace(0, np.nan)
+        media_volume.replace(
+            0,
+            np.nan
+        )
     )
 
     df["volume_z"] = (
@@ -378,9 +410,11 @@ def calcular_indicadores(df):
             df["volume"].rolling(50).mean()
         )
         /
-        desvio_volume.replace(0, np.nan)
+        desvio_volume.replace(
+            0,
+            np.nan
+        )
     )
-
 
     # --------------------------------------------------------
     # VWAP
@@ -404,7 +438,6 @@ def calcular_indicadores(df):
         .rolling(50)
         .sum()
     )
-
 
     # --------------------------------------------------------
     # CVD APROXIMADO
@@ -433,7 +466,6 @@ def calcular_indicadores(df):
         .diff(12)
     )
 
-
     return df
 
 
@@ -445,14 +477,12 @@ def calcular_imbalance(orderbook):
 
     bids = sum(
         float(qtd)
-        for preco, qtd
-        in orderbook["bids"]
+        for preco, qtd in orderbook["bids"]
     )
 
     asks = sum(
         float(qtd)
-        for preco, qtd
-        in orderbook["asks"]
+        for preco, qtd in orderbook["asks"]
     )
 
     total = bids + asks
@@ -470,55 +500,96 @@ def calcular_imbalance(orderbook):
 # SCORE QUANTITATIVO
 # ============================================================
 
-def gerar_score(row, imbalance):
+def gerar_score(
+    row,
+    imbalance
+):
 
     long_score = 0
     short_score = 0
 
+    fatores_long = []
+    fatores_short = []
 
     # --------------------------------------------------------
-    # TENDÊNCIA
+    # EMA 20 / 50
     # --------------------------------------------------------
 
     if row["ema20"] > row["ema50"]:
 
         long_score += 15
 
+        fatores_long.append(
+            ("EMA 20 > EMA 50", 15)
+        )
+
     else:
 
         short_score += 15
 
+        fatores_short.append(
+            ("EMA 20 < EMA 50", 15)
+        )
+
+    # --------------------------------------------------------
+    # EMA 200
+    # --------------------------------------------------------
 
     if row["close"] > row["ema200"]:
 
         long_score += 10
 
+        fatores_long.append(
+            ("Preço acima da EMA 200", 10)
+        )
+
     else:
 
         short_score += 10
 
+        fatores_short.append(
+            ("Preço abaixo da EMA 200", 10)
+        )
 
     # --------------------------------------------------------
-    # MOMENTUM
+    # MOMENTUM 1H
     # --------------------------------------------------------
 
     if row["ret_12"] > 0:
 
         long_score += 10
 
+        fatores_long.append(
+            ("Momentum 1H positivo", 10)
+        )
+
     else:
 
         short_score += 10
 
+        fatores_short.append(
+            ("Momentum 1H negativo", 10)
+        )
+
+    # --------------------------------------------------------
+    # MOMENTUM 4H
+    # --------------------------------------------------------
 
     if row["ret_48"] > 0:
 
         long_score += 10
 
+        fatores_long.append(
+            ("Momentum 4H positivo", 10)
+        )
+
     else:
 
         short_score += 10
 
+        fatores_short.append(
+            ("Momentum 4H negativo", 10)
+        )
 
     # --------------------------------------------------------
     # RSI
@@ -528,15 +599,34 @@ def gerar_score(row, imbalance):
 
         long_score += 10
 
+        fatores_long.append(
+            (
+                f"RSI favorável ({row['rsi']:.1f})",
+                10
+            )
+        )
+
     elif 30 <= row["rsi"] < 50:
 
         short_score += 5
 
+        fatores_short.append(
+            (
+                f"RSI enfraquecido ({row['rsi']:.1f})",
+                5
+            )
+        )
 
     if 30 <= row["rsi"] <= 45:
 
         short_score += 10
 
+        fatores_short.append(
+            (
+                f"RSI favorece SHORT ({row['rsi']:.1f})",
+                10
+            )
+        )
 
     # --------------------------------------------------------
     # VOLUME
@@ -548,10 +638,25 @@ def gerar_score(row, imbalance):
 
             long_score += 10
 
+            fatores_long.append(
+                (
+                    f"Volume forte + candle positivo "
+                    f"(Z={row['volume_z']:.2f})",
+                    10
+                )
+            )
+
         else:
 
             short_score += 10
 
+            fatores_short.append(
+                (
+                    f"Volume forte + candle negativo "
+                    f"(Z={row['volume_z']:.2f})",
+                    10
+                )
+            )
 
     # --------------------------------------------------------
     # VWAP
@@ -561,10 +666,17 @@ def gerar_score(row, imbalance):
 
         long_score += 10
 
+        fatores_long.append(
+            ("Preço acima da VWAP", 10)
+        )
+
     else:
 
         short_score += 10
 
+        fatores_short.append(
+            ("Preço abaixo da VWAP", 10)
+        )
 
     # --------------------------------------------------------
     # CVD
@@ -574,10 +686,17 @@ def gerar_score(row, imbalance):
 
         long_score += 10
 
+        fatores_long.append(
+            ("CVD comprador", 10)
+        )
+
     elif row["cvd_delta"] < 0:
 
         short_score += 10
 
+        fatores_short.append(
+            ("CVD vendedor", 10)
+        )
 
     # --------------------------------------------------------
     # ORDER BOOK
@@ -587,10 +706,25 @@ def gerar_score(row, imbalance):
 
         long_score += 10
 
+        fatores_long.append(
+            (
+                f"Order Book comprador "
+                f"({imbalance:+.2%})",
+                10
+            )
+        )
+
     elif imbalance < -0.10:
 
         short_score += 10
 
+        fatores_short.append(
+            (
+                f"Order Book vendedor "
+                f"({imbalance:+.2%})",
+                10
+            )
+        )
 
     # --------------------------------------------------------
     # REGIME
@@ -605,21 +739,17 @@ def gerar_score(row, imbalance):
         regime = "BAIXA VOLATILIDADE"
 
     elif (
-        row["ema20"] >
-        row["ema50"]
+        row["ema20"] > row["ema50"]
         and
-        row["close"] >
-        row["ema200"]
+        row["close"] > row["ema200"]
     ):
 
         regime = "TENDÊNCIA ALTA"
 
     elif (
-        row["ema20"] <
-        row["ema50"]
+        row["ema20"] < row["ema50"]
         and
-        row["close"] <
-        row["ema200"]
+        row["close"] < row["ema200"]
     ):
 
         regime = "TENDÊNCIA BAIXA"
@@ -628,7 +758,6 @@ def gerar_score(row, imbalance):
 
         regime = "NEUTRO"
 
-
     # --------------------------------------------------------
     # SINAL
     # --------------------------------------------------------
@@ -636,8 +765,7 @@ def gerar_score(row, imbalance):
     if (
         long_score >= 65
         and
-        long_score >
-        short_score + 10
+        long_score > short_score + 10
     ):
 
         sinal = "LONG"
@@ -645,8 +773,7 @@ def gerar_score(row, imbalance):
     elif (
         short_score >= 65
         and
-        short_score >
-        long_score + 10
+        short_score > long_score + 10
     ):
 
         sinal = "SHORT"
@@ -655,18 +782,68 @@ def gerar_score(row, imbalance):
 
         sinal = "NEUTRO"
 
-
     return (
         long_score,
         short_score,
         sinal,
-        regime
+        regime,
+        fatores_long,
+        fatores_short
     )
 
 
 # ============================================================
-# REGISTRAR TRADE
+# TRADES
 # ============================================================
+
+def consultar_trades():
+
+    conn = conectar()
+
+    df = pd.read_sql_query(
+        """
+        SELECT *
+        FROM trades
+        ORDER BY id DESC
+        """,
+        conn
+    )
+
+    conn.close()
+
+    return df
+
+
+def buscar_trade_aberto():
+
+    conn = conectar()
+
+    trade = conn.execute(
+        """
+        SELECT *
+        FROM trades
+        WHERE exit_time IS NULL
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    colunas = [
+        desc[0]
+        for desc in conn.execute(
+            "PRAGMA table_info(trades)"
+        ).fetchall()
+    ]
+
+    conn.close()
+
+    if trade is None:
+        return None
+
+    return dict(
+        zip(colunas, trade)
+    )
+
 
 def registrar_trade(
     side,
@@ -675,7 +852,8 @@ def registrar_trade(
     alvo,
     score,
     regime,
-    observacao
+    observacao,
+    signal_time
 ):
 
     conn = conectar()
@@ -698,10 +876,11 @@ def registrar_trade(
             target_price,
             score,
             regime,
-            notes
+            notes,
+            signal_time
         )
 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
 
         (
@@ -713,17 +892,14 @@ def registrar_trade(
             alvo,
             score,
             regime,
-            observacao
+            observacao,
+            signal_time
         )
     )
 
     conn.commit()
     conn.close()
 
-
-# ============================================================
-# FECHAR TRADE
-# ============================================================
 
 def fechar_trade(
     trade_id,
@@ -747,16 +923,12 @@ def fechar_trade(
         (trade_id,)
     ).fetchone()
 
-
     if not trade:
 
         conn.close()
-
         return
 
-
     side, entrada = trade
-
 
     if side == "LONG":
 
@@ -774,7 +946,6 @@ def fechar_trade(
             1
         ) * 100
 
-
     if pnl > 0:
 
         resultado = "GAIN"
@@ -787,13 +958,11 @@ def fechar_trade(
 
         resultado = "ZERO"
 
-
     agora = (
         datetime
         .now(timezone.utc)
         .isoformat()
     )
-
 
     conn.execute(
         """
@@ -817,40 +986,37 @@ def fechar_trade(
         )
     )
 
-
     conn.commit()
     conn.close()
 
 
 # ============================================================
-# CONSULTAR TRADES
+# VERIFICAR SE JÁ HOUVE ENTRADA NA VELA
 # ============================================================
 
-def consultar_trades():
+def entrada_ja_registrada(signal_time):
 
     conn = conectar()
 
-    df = pd.read_sql_query(
+    resultado = conn.execute(
         """
-        SELECT *
-
+        SELECT COUNT(*)
         FROM trades
-
-        ORDER BY id DESC
+        WHERE signal_time = ?
         """,
-        conn
-    )
+        (signal_time,)
+    ).fetchone()[0]
 
     conn.close()
 
-    return df
+    return resultado > 0
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.title("⚙️ Configuração")
+st.sidebar.title("⚙️ Configuração do Robô")
 
 timeframe = st.sidebar.selectbox(
     "Timeframe",
@@ -865,7 +1031,6 @@ timeframe = st.sidebar.selectbox(
     index=1
 )
 
-
 quantidade = st.sidebar.slider(
     "Candles",
     200,
@@ -873,7 +1038,6 @@ quantidade = st.sidebar.slider(
     500,
     100
 )
-
 
 atr_stop = st.sidebar.number_input(
     "Stop ATR",
@@ -883,7 +1047,6 @@ atr_stop = st.sidebar.number_input(
     0.1
 )
 
-
 atr_target = st.sidebar.number_input(
     "Target ATR",
     0.1,
@@ -892,213 +1055,722 @@ atr_target = st.sidebar.number_input(
     0.1
 )
 
+st.sidebar.divider()
+
+st.sidebar.success(
+    f"🤖 ROBÔ ATIVO\n\n"
+    f"Atualização: {AUTO_REFRESH_SECONDS}s"
+)
 
 if st.sidebar.button(
-    "🔄 Atualizar"
+    "🔄 Atualizar agora"
 ):
 
     st.cache_data.clear()
-
     st.rerun()
 
 
 # ============================================================
-# BUSCAR DADOS
+# FUNÇÃO PRINCIPAL DO MONITOR
 # ============================================================
 
-try:
+def executar_monitor():
 
-    df = buscar_candles(
-        SYMBOL,
-        timeframe,
-        quantidade
-    )
+    try:
 
-    df = calcular_indicadores(df)
+        # ----------------------------------------------------
+        # DADOS
+        # ----------------------------------------------------
 
-    preco = buscar_preco()
+        df = buscar_candles(
+            SYMBOL,
+            timeframe,
+            quantidade
+        )
 
-    orderbook = buscar_orderbook()
+        df = calcular_indicadores(df)
 
-    imbalance = calcular_imbalance(
-        orderbook
-    )
+        preco = buscar_preco()
 
-    ultima = df.iloc[-1]
+        orderbook = buscar_orderbook()
 
-    (
-        long_score,
-        short_score,
-        sinal,
-        regime
-    ) = gerar_score(
-        ultima,
-        imbalance
-    )
+        imbalance = calcular_imbalance(
+            orderbook
+        )
+
+        # ----------------------------------------------------
+        # IMPORTANTE:
+        # usar a última vela FECHADA para o sinal
+        # ----------------------------------------------------
+
+        ultima = df.iloc[-2]
+
+        signal_time = str(
+            df.index[-2]
+        )
+
+        (
+            long_score,
+            short_score,
+            sinal,
+            regime,
+            fatores_long,
+            fatores_short
+        ) = gerar_score(
+            ultima,
+            imbalance
+        )
+
+        # ----------------------------------------------------
+        # ATR
+        # ----------------------------------------------------
+
+        atr = float(
+            ultima["atr"]
+        )
+
+        # ----------------------------------------------------
+        # PLANO DA OPERAÇÃO
+        # ----------------------------------------------------
+
+        if sinal == "LONG":
+
+            stop = (
+                preco -
+                atr * atr_stop
+            )
+
+            alvo = (
+                preco +
+                atr * atr_target
+            )
+
+            score_operacao = long_score
+
+        elif sinal == "SHORT":
+
+            stop = (
+                preco +
+                atr * atr_stop
+            )
+
+            alvo = (
+                preco -
+                atr * atr_target
+            )
+
+            score_operacao = short_score
+
+        else:
+
+            stop = np.nan
+            alvo = np.nan
+
+            score_operacao = max(
+                long_score,
+                short_score
+            )
+
+        # ----------------------------------------------------
+        # OPERAÇÃO ABERTA
+        # ----------------------------------------------------
+
+        trade_aberto = buscar_trade_aberto()
+
+        # ----------------------------------------------------
+        # MONITORAR TRADE EXISTENTE
+        # ----------------------------------------------------
+
+        if trade_aberto is not None:
+
+            side = trade_aberto["side"]
+
+            entrada = float(
+                trade_aberto["entry_price"]
+            )
+
+            stop_aberto = float(
+                trade_aberto["stop_price"]
+            )
+
+            alvo_aberto = float(
+                trade_aberto["target_price"]
+            )
+
+            trade_id = int(
+                trade_aberto["id"]
+            )
+
+            # ----------------------------------------------
+            # LONG
+            # ----------------------------------------------
+
+            if side == "LONG":
+
+                # STOP
+                if preco <= stop_aberto:
+
+                    fechar_trade(
+                        trade_id,
+                        stop_aberto
+                    )
+
+                    st.session_state["ultimo_evento"] = (
+                        f"🛑 STOP atingido no LONG #{trade_id}"
+                    )
+
+                # TARGET
+                elif preco >= alvo_aberto:
+
+                    fechar_trade(
+                        trade_id,
+                        alvo_aberto
+                    )
+
+                    st.session_state["ultimo_evento"] = (
+                        f"🎯 TARGET atingido no LONG #{trade_id}"
+                    )
+
+            # ----------------------------------------------
+            # SHORT
+            # ----------------------------------------------
+
+            elif side == "SHORT":
+
+                # STOP
+                if preco >= stop_aberto:
+
+                    fechar_trade(
+                        trade_id,
+                        stop_aberto
+                    )
+
+                    st.session_state["ultimo_evento"] = (
+                        f"🛑 STOP atingido no SHORT #{trade_id}"
+                    )
+
+                # TARGET
+                elif preco <= alvo_aberto:
+
+                    fechar_trade(
+                        trade_id,
+                        alvo_aberto
+                    )
+
+                    st.session_state["ultimo_evento"] = (
+                        f"🎯 TARGET atingido no SHORT #{trade_id}"
+                    )
+
+        # ----------------------------------------------------
+        # VERIFICAR NOVA ENTRADA
+        # ----------------------------------------------------
+
+        trade_aberto = buscar_trade_aberto()
+
+        if (
+            trade_aberto is None
+            and
+            sinal in ["LONG", "SHORT"]
+            and
+            not entrada_ja_registrada(
+                signal_time
+            )
+        ):
+
+            if sinal == "LONG":
+
+                motivos = "; ".join(
+                    [
+                        f"{nome} +{pontos}"
+                        for nome, pontos
+                        in fatores_long
+                    ]
+                )
+
+            else:
+
+                motivos = "; ".join(
+                    [
+                        f"{nome} +{pontos}"
+                        for nome, pontos
+                        in fatores_short
+                    ]
+                )
+
+            observacao = (
+                f"Sinal={sinal}; "
+                f"Long={long_score}; "
+                f"Short={short_score}; "
+                f"Regime={regime}; "
+                f"Motivos={motivos}"
+            )
+
+            registrar_trade(
+                sinal,
+                preco,
+                stop,
+                alvo,
+                score_operacao,
+                regime,
+                observacao,
+                signal_time
+            )
+
+            st.session_state["ultimo_evento"] = (
+                f"🚨 NOVA ENTRADA AUTOMÁTICA: "
+                f"{sinal}"
+            )
+
+        return {
+            "df": df,
+            "preco": preco,
+            "ultima": ultima,
+            "imbalance": imbalance,
+            "long_score": long_score,
+            "short_score": short_score,
+            "sinal": sinal,
+            "regime": regime,
+            "fatores_long": fatores_long,
+            "fatores_short": fatores_short,
+            "atr": atr,
+            "stop": stop,
+            "alvo": alvo,
+            "signal_time": signal_time
+        }
+
+    except Exception as erro:
+
+        st.error(
+            f"Erro no monitoramento: {erro}"
+        )
+
+        return None
 
 
-except Exception as erro:
+# ============================================================
+# EXECUTAR MONITOR
+# ============================================================
 
-    st.error(
-        f"Erro na API: {erro}"
-    )
+dados = executar_monitor()
 
+if dados is None:
     st.stop()
 
 
+df = dados["df"]
+preco = dados["preco"]
+ultima = dados["ultima"]
+
+imbalance = dados["imbalance"]
+
+long_score = dados["long_score"]
+short_score = dados["short_score"]
+
+sinal = dados["sinal"]
+regime = dados["regime"]
+
+fatores_long = dados["fatores_long"]
+fatores_short = dados["fatores_short"]
+
+atr = dados["atr"]
+stop = dados["stop"]
+alvo = dados["alvo"]
+
+signal_time = dados["signal_time"]
+
+
 # ============================================================
-# DASHBOARD
+# CABEÇALHO
 # ============================================================
 
 st.title(
-    "₿ BTC Quant Trader"
+    "₿ BTC Quant Trader V2"
 )
 
 st.caption(
-    "Análise quantitativa + paper trading"
+    "Robô de monitoramento + paper trading automático"
 )
 
 
-col1, col2, col3, col4, col5 = st.columns(5)
+# ============================================================
+# STATUS DO ROBÔ
+# ============================================================
+
+agora = datetime.now(
+    timezone.utc
+)
+
+c1, c2, c3 = st.columns(3)
+
+c1.success(
+    "🤖 ROBÔ MONITORANDO"
+)
+
+c2.metric(
+    "Atualização",
+    f"{AUTO_REFRESH_SECONDS}s"
+)
+
+c3.write(
+    f"Última verificação:\n"
+    f"{agora.strftime('%H:%M:%S')} UTC"
+)
 
 
-col1.metric(
+# ============================================================
+# ÚLTIMO EVENTO
+# ============================================================
+
+if "ultimo_evento" in st.session_state:
+
+    st.info(
+        st.session_state["ultimo_evento"]
+    )
+
+
+# ============================================================
+# DASHBOARD PRINCIPAL
+# ============================================================
+
+st.subheader(
+    "📊 Mercado"
+)
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+c1.metric(
     "BTC",
     f"${preco:,.2f}"
 )
 
-
-col2.metric(
+c2.metric(
     "LONG",
     f"{long_score}/100"
 )
 
-
-col3.metric(
+c3.metric(
     "SHORT",
     f"{short_score}/100"
 )
 
-
-col4.metric(
+c4.metric(
     "REGIME",
     regime
 )
 
-
-col5.metric(
+c5.metric(
     "BOOK",
     f"{imbalance:+.2%}"
 )
 
 
 # ============================================================
-# SINAL
+# DECISÃO
 # ============================================================
 
 st.subheader(
-    "🎯 Sinal"
+    "🎯 DECISÃO DO ROBÔ"
 )
 
+trade_aberto = buscar_trade_aberto()
 
-if sinal == "LONG":
+if trade_aberto is not None:
 
-    st.success(
-        f"LONG — Score {long_score}/100"
+    side = trade_aberto["side"]
+
+    entrada_aberta = float(
+        trade_aberto["entry_price"]
     )
 
-elif sinal == "SHORT":
+    stop_aberto = float(
+        trade_aberto["stop_price"]
+    )
 
-    st.error(
-        f"SHORT — Score {short_score}/100"
+    alvo_aberto = float(
+        trade_aberto["target_price"]
+    )
+
+    if side == "LONG":
+
+        pnl_atual = (
+            preco /
+            entrada_aberta -
+            1
+        ) * 100
+
+        st.success(
+            f"🟢 LONG EM ANDAMENTO — "
+            f"Operação #{trade_aberto['id']}"
+        )
+
+    else:
+
+        pnl_atual = (
+            entrada_aberta /
+            preco -
+            1
+        ) * 100
+
+        st.error(
+            f"🔴 SHORT EM ANDAMENTO — "
+            f"Operação #{trade_aberto['id']}"
+        )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    c1.metric(
+        "Entrada",
+        f"${entrada_aberta:,.2f}"
+    )
+
+    c2.metric(
+        "Preço atual",
+        f"${preco:,.2f}"
+    )
+
+    c3.metric(
+        "Stop",
+        f"${stop_aberto:,.2f}"
+    )
+
+    c4.metric(
+        "Target",
+        f"${alvo_aberto:,.2f}"
+    )
+
+    c5.metric(
+        "P&L atual",
+        f"{pnl_atual:+.2f}%"
     )
 
 else:
 
-    st.info(
-        f"NEUTRO | "
-        f"Long {long_score} | "
-        f"Short {short_score}"
-    )
+    if sinal == "LONG":
+
+        st.success(
+            f"🟢 COMPRAR BTC\n\n"
+            f"Score LONG: {long_score}/100"
+        )
+
+    elif sinal == "SHORT":
+
+        st.error(
+            f"🔴 VENDER / SHORT BTC\n\n"
+            f"Score SHORT: {short_score}/100"
+        )
+
+    else:
+
+        st.warning(
+            f"🟡 AGUARDAR — NÃO OPERAR\n\n"
+            f"Long {long_score} | "
+            f"Short {short_score}"
+        )
 
 
 # ============================================================
-# STOP / TARGET
+# PLANO DE OPERAÇÃO
 # ============================================================
 
-atr = float(
-    ultima["atr"]
-)
+if trade_aberto is not None:
 
+    entrada_plano = entrada_aberta
+    stop_plano = stop_aberto
+    alvo_plano = alvo_aberto
+    lado_plano = side
 
-if sinal == "LONG":
+elif sinal in ["LONG", "SHORT"]:
 
-    stop = (
-        preco -
-        atr * atr_stop
-    )
-
-    alvo = (
-        preco +
-        atr * atr_target
-    )
-
-    score_operacao = long_score
-
-
-elif sinal == "SHORT":
-
-    stop = (
-        preco +
-        atr * atr_stop
-    )
-
-    alvo = (
-        preco -
-        atr * atr_target
-    )
-
-    score_operacao = short_score
-
+    entrada_plano = preco
+    stop_plano = stop
+    alvo_plano = alvo
+    lado_plano = sinal
 
 else:
 
-    stop = np.nan
-    alvo = np.nan
+    entrada_plano = np.nan
+    stop_plano = np.nan
+    alvo_plano = np.nan
+    lado_plano = None
 
-    score_operacao = max(
-        long_score,
-        short_score
+
+if lado_plano is not None:
+
+    distancia_stop = abs(
+        entrada_plano -
+        stop_plano
     )
 
+    distancia_alvo = abs(
+        alvo_plano -
+        entrada_plano
+    )
 
-c1, c2, c3, c4 = st.columns(4)
+    risco_retorno = (
+        distancia_alvo /
+        distancia_stop
+        if distancia_stop > 0
+        else 0
+    )
+
+    st.subheader(
+        "📋 Plano da operação"
+    )
+
+    if lado_plano == "LONG":
+
+        st.success(
+            "🟢 OPERAÇÃO DE COMPRA"
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "📥 ENTRADA",
+            f"${entrada_plano:,.2f}"
+        )
+
+        c2.metric(
+            "🛑 STOP",
+            f"${stop_plano:,.2f}"
+        )
+
+        c3.metric(
+            "🎯 TARGET",
+            f"${alvo_plano:,.2f}"
+        )
+
+        c4.metric(
+            "Risco / Retorno",
+            f"1:{risco_retorno:.2f}"
+        )
+
+        st.write(
+            f"👉 **COMPRAR** em "
+            f"${entrada_plano:,.2f}"
+        )
+
+        st.write(
+            f"🛑 Sair com perda se atingir "
+            f"${stop_plano:,.2f}"
+        )
+
+        st.write(
+            f"🎯 Realizar lucro se atingir "
+            f"${alvo_plano:,.2f}"
+        )
+
+    else:
+
+        st.error(
+            "🔴 OPERAÇÃO DE VENDA / SHORT"
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "📤 ENTRADA",
+            f"${entrada_plano:,.2f}"
+        )
+
+        c2.metric(
+            "🛑 STOP",
+            f"${stop_plano:,.2f}"
+        )
+
+        c3.metric(
+            "🎯 TARGET",
+            f"${alvo_plano:,.2f}"
+        )
+
+        c4.metric(
+            "Risco / Retorno",
+            f"1:{risco_retorno:.2f}"
+        )
+
+        st.write(
+            f"👉 **VENDER / SHORT** em "
+            f"${entrada_plano:,.2f}"
+        )
+
+        st.write(
+            f"🛑 Sair com perda se atingir "
+            f"${stop_plano:,.2f}"
+        )
+
+        st.write(
+            f"🎯 Realizar lucro se atingir "
+            f"${alvo_plano:,.2f}"
+        )
 
 
-c1.metric(
-    "ATR",
-    f"${atr:,.2f}"
+# ============================================================
+# INDICADORES QUE DERAM PONTOS
+# ============================================================
+
+st.subheader(
+    "🧠 Por que o robô chegou nessa decisão?"
 )
 
-
-c2.metric(
-    "Entrada",
-    f"${preco:,.2f}"
-)
+col_long, col_short = st.columns(2)
 
 
-c3.metric(
-    "Stop",
-    "-" if np.isnan(stop)
-    else f"${stop:,.2f}"
-)
+with col_long:
+
+    st.markdown(
+        "### 🟢 Fatores LONG"
+    )
+
+    if fatores_long:
+
+        tabela_long = pd.DataFrame(
+            fatores_long,
+            columns=[
+                "Indicador",
+                "Pontos"
+            ]
+        )
+
+        st.dataframe(
+            tabela_long,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    else:
+
+        st.write(
+            "Nenhum indicador favorecendo LONG."
+        )
 
 
-c4.metric(
-    "Target",
-    "-" if np.isnan(alvo)
-    else f"${alvo:,.2f}"
-)
+with col_short:
+
+    st.markdown(
+        "### 🔴 Fatores SHORT"
+    )
+
+    if fatores_short:
+
+        tabela_short = pd.DataFrame(
+            fatores_short,
+            columns=[
+                "Indicador",
+                "Pontos"
+            ]
+        )
+
+        st.dataframe(
+            tabela_short,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    else:
+
+        st.write(
+            "Nenhum indicador favorecendo SHORT."
+        )
 
 
 # ============================================================
@@ -1108,7 +1780,6 @@ c4.metric(
 st.subheader(
     "📊 Variáveis quantitativas"
 )
-
 
 dados_variaveis = pd.DataFrame({
 
@@ -1120,6 +1791,7 @@ dados_variaveis = pd.DataFrame({
         "RSI",
         "Retorno 1 candle",
         "Retorno 1h",
+        "Retorno 4h",
         "Volatilidade Z",
         "Volume Ratio",
         "Volume Z",
@@ -1137,6 +1809,7 @@ dados_variaveis = pd.DataFrame({
         ultima["rsi"],
         ultima["ret_1"],
         ultima["ret_12"],
+        ultima["ret_48"],
         ultima["vol_z"],
         ultima["volume_ratio"],
         ultima["volume_z"],
@@ -1146,7 +1819,6 @@ dados_variaveis = pd.DataFrame({
         imbalance
     ]
 })
-
 
 st.dataframe(
     dados_variaveis,
@@ -1163,9 +1835,7 @@ st.subheader(
     "📈 Gráfico BTC"
 )
 
-
 grafico = go.Figure()
-
 
 grafico.add_trace(
     go.Candlestick(
@@ -1184,7 +1854,6 @@ grafico.add_trace(
     )
 )
 
-
 grafico.add_trace(
     go.Scatter(
 
@@ -1195,7 +1864,6 @@ grafico.add_trace(
         name="EMA 20"
     )
 )
-
 
 grafico.add_trace(
     go.Scatter(
@@ -1208,7 +1876,6 @@ grafico.add_trace(
     )
 )
 
-
 grafico.add_trace(
     go.Scatter(
 
@@ -1219,7 +1886,6 @@ grafico.add_trace(
         name="EMA 200"
     )
 )
-
 
 grafico.add_trace(
     go.Scatter(
@@ -1232,6 +1898,26 @@ grafico.add_trace(
     )
 )
 
+# ------------------------------------------------------------
+# MARCAR ENTRADA
+# ------------------------------------------------------------
+
+if trade_aberto is not None:
+
+    grafico.add_hline(
+        y=entrada_aberta,
+        annotation_text="ENTRADA"
+    )
+
+    grafico.add_hline(
+        y=stop_aberto,
+        annotation_text="STOP"
+    )
+
+    grafico.add_hline(
+        y=alvo_aberto,
+        annotation_text="TARGET"
+    )
 
 grafico.update_layout(
 
@@ -1240,7 +1926,6 @@ grafico.update_layout(
     xaxis_rangeslider_visible=False
 )
 
-
 st.plotly_chart(
     grafico,
     use_container_width=True
@@ -1248,243 +1933,42 @@ st.plotly_chart(
 
 
 # ============================================================
-# REGISTRAR OPERAÇÃO
-# ============================================================
-
-st.subheader(
-    "📝 Registrar operação"
-)
-
-
-with st.form(
-    "form_trade"
-):
-
-    c1, c2 = st.columns(2)
-
-
-    with c1:
-
-        lado = st.selectbox(
-            "Direção",
-            [
-                "LONG",
-                "SHORT"
-            ]
-        )
-
-
-        entrada = st.number_input(
-            "Entrada",
-            value=float(preco),
-            min_value=0.01
-        )
-
-
-    with c2:
-
-        stop_manual = st.number_input(
-            "Stop",
-            value=float(
-                stop
-                if not np.isnan(stop)
-                else preco - atr * atr_stop
-            ),
-            min_value=0.01
-        )
-
-
-        alvo_manual = st.number_input(
-            "Target",
-            value=float(
-                alvo
-                if not np.isnan(alvo)
-                else preco + atr * atr_target
-            ),
-            min_value=0.01
-        )
-
-
-    observacao = st.text_input(
-        "Observação",
-        value=(
-            f"Sinal={sinal}; "
-            f"Regime={regime}"
-        )
-    )
-
-
-    registrar = st.form_submit_button(
-        "➕ Registrar"
-    )
-
-
-    if registrar:
-
-        score = (
-            long_score
-            if lado == "LONG"
-            else short_score
-        )
-
-
-        registrar_trade(
-
-            lado,
-
-            entrada,
-
-            stop_manual,
-
-            alvo_manual,
-
-            score,
-
-            regime,
-
-            observacao
-        )
-
-
-        st.success(
-            "Operação registrada."
-        )
-
-
-        st.rerun()
-
-
-# ============================================================
-# OPERAÇÕES ABERTAS
-# ============================================================
-
-trades = consultar_trades()
-
-
-st.subheader(
-    "📌 Operações abertas"
-)
-
-
-abertas = trades[
-    trades["exit_time"].isna()
-]
-
-
-if len(abertas) == 0:
-
-    st.info(
-        "Nenhuma operação aberta."
-    )
-
-
-else:
-
-    for _, trade in abertas.iterrows():
-
-        with st.container(
-            border=True
-        ):
-
-            st.write(
-                f"### #{int(trade['id'])} "
-                f"{trade['side']}"
-            )
-
-
-            st.write(
-                f"Entrada: "
-                f"${trade['entry_price']:,.2f}"
-            )
-
-
-            st.write(
-                f"Stop: "
-                f"${trade['stop_price']:,.2f}"
-            )
-
-
-            st.write(
-                f"Target: "
-                f"${trade['target_price']:,.2f}"
-            )
-
-
-            saida = st.number_input(
-
-                "Preço de saída",
-
-                value=float(preco),
-
-                min_value=0.01,
-
-                key=f"saida_{trade['id']}"
-            )
-
-
-            if st.button(
-                "Fechar operação",
-                key=f"fechar_{trade['id']}"
-            ):
-
-                fechar_trade(
-
-                    int(trade["id"]),
-
-                    saida
-                )
-
-
-                st.success(
-                    "Operação encerrada."
-                )
-
-
-                st.rerun()
-
-
-# ============================================================
 # PERFORMANCE
 # ============================================================
 
 st.subheader(
-    "💰 Performance"
+    "💰 Performance do robô"
 )
 
+trades = consultar_trades()
 
 fechadas = trades[
     trades["exit_time"].notna()
 ].copy()
 
-
 if len(fechadas) == 0:
 
     st.info(
-        "Nenhuma operação encerrada."
+        "O robô ainda não possui operações encerradas."
     )
-
 
 else:
 
     total = len(fechadas)
 
-
     gains = fechadas[
         fechadas["pnl_pct"] > 0
     ]
 
-
     losses = fechadas[
         fechadas["pnl_pct"] < 0
     ]
-
 
     wr = (
         len(gains) /
         total *
         100
     )
-
 
     avg_gain = (
 
@@ -1495,7 +1979,6 @@ else:
         else 0
     )
 
-
     avg_loss = (
 
         losses["pnl_pct"].mean()
@@ -1504,7 +1987,6 @@ else:
 
         else 0
     )
-
 
     expectancy = (
 
@@ -1516,7 +1998,6 @@ else:
         ((100 - wr) / 100) *
         avg_loss
     )
-
 
     if len(losses) > 0:
 
@@ -1533,39 +2014,32 @@ else:
 
         profit_factor = np.nan
 
-
     c1, c2, c3, c4, c5 = st.columns(5)
-
 
     c1.metric(
         "Trades",
         total
     )
 
-
     c2.metric(
         "Win Rate",
         f"{wr:.2f}%"
     )
-
 
     c3.metric(
         "Gain Médio",
         f"{avg_gain:.2f}%"
     )
 
-
     c4.metric(
         "Loss Médio",
         f"{avg_loss:.2f}%"
     )
 
-
     c5.metric(
         "Expectancy",
         f"{expectancy:.3f}%"
     )
-
 
     st.metric(
 
@@ -1580,24 +2054,20 @@ else:
         else f"{profit_factor:.2f}"
     )
 
-
     # --------------------------------------------------------
-    # CURVA DE EQUITY
+    # EQUITY
     # --------------------------------------------------------
 
     fechadas = fechadas.sort_values(
         "id"
     )
 
-
     fechadas["equity"] = (
         fechadas["pnl_pct"]
         .cumsum()
     )
 
-
     curva = go.Figure()
-
 
     curva.add_trace(
         go.Scatter(
@@ -1617,7 +2087,6 @@ else:
         )
     )
 
-
     curva.update_layout(
 
         title="Curva de P&L acumulado",
@@ -1629,10 +2098,89 @@ else:
         height=400
     )
 
-
     st.plotly_chart(
         curva,
         use_container_width=True
+    )
+
+
+# ============================================================
+# OPERAÇÕES ABERTAS
+# ============================================================
+
+st.subheader(
+    "📌 Operação atualmente monitorada"
+)
+
+aberta = buscar_trade_aberto()
+
+if aberta is None:
+
+    st.info(
+        "Nenhuma operação aberta."
+    )
+
+else:
+
+    lado = aberta["side"]
+
+    entrada = float(
+        aberta["entry_price"]
+    )
+
+    stop_trade = float(
+        aberta["stop_price"]
+    )
+
+    alvo_trade = float(
+        aberta["target_price"]
+    )
+
+    if lado == "LONG":
+
+        pnl = (
+            preco /
+            entrada -
+            1
+        ) * 100
+
+    else:
+
+        pnl = (
+            entrada /
+            preco -
+            1
+        ) * 100
+
+    st.write(
+        f"### #{int(aberta['id'])} — {lado}"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Entrada",
+        f"${entrada:,.2f}"
+    )
+
+    c2.metric(
+        "Atual",
+        f"${preco:,.2f}"
+    )
+
+    c3.metric(
+        "Stop",
+        f"${stop_trade:,.2f}"
+    )
+
+    c4.metric(
+        "Target",
+        f"${alvo_trade:,.2f}"
+    )
+
+    st.metric(
+        "P&L atual",
+        f"{pnl:+.2f}%"
     )
 
 
@@ -1641,9 +2189,8 @@ else:
 # ============================================================
 
 st.subheader(
-    "🗂️ Histórico"
+    "🗂️ Histórico de operações"
 )
-
 
 if len(trades):
 
@@ -1664,11 +2211,32 @@ else:
 
 
 # ============================================================
+# AUTO REFRESH
+# ============================================================
+
+st.caption(
+    f"🤖 Monitoramento automático ativo — "
+    f"atualização a cada {AUTO_REFRESH_SECONDS} segundos."
+)
+
+# Streamlit moderno
+try:
+
+    st.fragment(
+        run_every=AUTO_REFRESH_SECONDS
+    )
+
+except Exception:
+
+    pass
+
+
+# ============================================================
 # AVISO
 # ============================================================
 
 st.caption(
-    "Este sistema é de análise e paper trading. "
-    "Não envia ordens reais. "
-    "A API utilizada é a API pública de dados da Binance."
+    "Paper Trading: este sistema não envia ordens reais. "
+    "As entradas e saídas são simuladas com dados públicos "
+    "da Binance."
 )
