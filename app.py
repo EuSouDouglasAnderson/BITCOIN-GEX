@@ -1,265 +1,194 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import plotly.graph_objects as go
-
 
 # ============================================================
-# CONFIGURAÇÕES
+# CONFIGURAÇÃO
 # ============================================================
-
 BINANCE_API = "https://data-api.binance.vision"
-
 SYMBOL = "BTCUSDT"
 INTERVAL = "5m"
-
-DATABASE = "btc_trader.db"
-
+DATABASE = "btc_trader_v2.db"
 AUTO_REFRESH_SECONDS = 10
-
 KLINE_LIMIT = 500
-
 ATR_STOP_MULTIPLIER = 1.0
 ATR_TARGET_MULTIPLIER = 2.0
 
-
 # ============================================================
-# CONFIGURAÇÃO STREAMLIT
+# PÁGINA / ESTILO
 # ============================================================
-
 st.set_page_config(
-    page_title="BTC Quant Trader",
+    page_title="BTC Quant Trader v2",
     page_icon="₿",
-    layout="wide"
+    layout="wide",
 )
-
-
-# ============================================================
-# TEMA ESCURO
-# ============================================================
 
 st.markdown(
     """
     <style>
-
-    /* Fundo geral */
-    .stApp {
-        background-color: #080808;
-        color: #F5F5F5;
-    }
-
-    /* Cabeçalho */
-    header[data-testid="stHeader"] {
-        background-color: #080808;
-    }
-
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background-color: #0D0D0D;
-    }
-
-    /* Texto */
-    .stApp p,
-    .stApp label,
-    .stApp span,
-    .stApp div {
-        color: #F1F1F1;
-    }
-
-    /* Cards */
-    div[data-testid="metric-container"] {
-        background-color: #111111;
-        border: 1px solid #252525;
-        border-radius: 12px;
-        padding: 12px;
-    }
-
-    /* Dataframes */
-    div[data-testid="stDataFrame"] {
-        background-color: #111111;
-        border-radius: 10px;
-    }
-
-    /* Inputs */
-    input,
-    textarea,
-    select {
-        background-color: #151515 !important;
-        color: #FFFFFF !important;
-    }
-
-    /* Botões */
-    .stButton > button {
-        background-color: #1A1A1A;
-        color: #FFFFFF;
-        border: 1px solid #333333;
-        border-radius: 8px;
-    }
-
-    .stButton > button:hover {
-        border-color: #666666;
-        color: #FFFFFF;
-    }
-
-    /* Divisórias */
-    hr {
-        border-color: #292929;
-    }
-
-    /* Alertas */
-    div[data-testid="stAlert"] {
-        border-radius: 10px;
-    }
-
-    /* Títulos */
-    h1, h2, h3 {
-        color: #FFFFFF !important;
-    }
-
+    .stApp { background: #0b0f14; color: #f5f7fa; }
+    [data-testid="stMetricValue"] { font-size: 1.55rem; }
+    .block-container { padding-top: 1rem; padding-bottom: 2rem; }
+    div[data-testid="stDataFrame"] { border: 1px solid #222a33; }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
-
 # ============================================================
-# BANCO
+# BANCO DE DADOS
+# Novo banco: btc_trader_v2.db
 # ============================================================
-
-def conectar():
-
-    return sqlite3.connect(
-        DATABASE,
-        check_same_thread=False
-    )
+def get_conn():
+    conn = sqlite3.connect(DATABASE, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 
 def criar_banco():
-
-    conn = conectar()
-
+    conn = get_conn()
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS trades (
-
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            symbol TEXT,
-            side TEXT,
-
-            entry_time TEXT,
-            entry_price REAL,
-
-            stop_price REAL,
-            target_price REAL,
-
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_time TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            stop_price REAL NOT NULL,
+            target_price REAL NOT NULL,
             exit_time TEXT,
             exit_price REAL,
-
             pnl_pct REAL,
             result TEXT,
-
             score REAL,
             regime TEXT,
-
             notes TEXT,
-            signal_time TEXT
+            signal_time TEXT,
+
+            -- Snapshot completo dos indicadores no momento da entrada
+            ema20 REAL,
+            ema50 REAL,
+            ema200 REAL,
+            rsi REAL,
+            atr REAL,
+            ret_1 REAL,
+            ret_3 REAL,
+            ret_12 REAL,
+            ret_48 REAL,
+            volatility REAL,
+            vol_z REAL,
+            volume_ratio REAL,
+            volume_z REAL,
+            vwap REAL,
+            cvd_delta REAL,
+            orderbook_imbalance REAL,
+            score_compra REAL,
+            score_venda REAL,
+            signal TEXT,
+            entry_reason TEXT
         )
         """
     )
-
-    conn.commit()
-
-    colunas_existentes = {
-        row[1]
-        for row in conn.execute(
-            "PRAGMA table_info(trades)"
-        ).fetchall()
-    }
-
-    if "signal_time" not in colunas_existentes:
-
-        conn.execute(
-            """
-            ALTER TABLE trades
-            ADD COLUMN signal_time TEXT
-            """
-        )
-
     conn.commit()
     conn.close()
 
 
+criar_banco()
+
 # ============================================================
-# OPERAÇÕES ABERTAS
+# FUNÇÕES AUXILIARES
 # ============================================================
+def agora():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_num(value, casas=2):
+    if value is None or not np.isfinite(float(value)):
+        return "-"
+    return f"{float(value):,.{casas}f}"
+
 
 def buscar_operacoes_abertas():
-
-    conn = conectar()
-
+    conn = get_conn()
     df = pd.read_sql_query(
         """
         SELECT
-            id,
-            symbol,
-            side,
-            entry_time,
-            entry_price,
-            stop_price,
-            target_price,
-            exit_time,
-            exit_price,
-            pnl_pct,
-            result,
-            score,
-            regime,
-            notes,
-            signal_time
+            id, symbol, side, entry_time, entry_price, stop_price, target_price,
+            exit_time, exit_price, pnl_pct, result, score, regime, notes,
+            signal_time, ema20, ema50, ema200, rsi, atr, ret_1, ret_3, ret_12,
+            ret_48, volatility, vol_z, volume_ratio, volume_z, vwap, cvd_delta,
+            orderbook_imbalance, score_compra, score_venda, signal, entry_reason
         FROM trades
         WHERE exit_time IS NULL
-        ORDER BY id ASC
+        ORDER BY id DESC
         """,
-        conn
+        conn,
     )
-
     conn.close()
-
     return df
 
 
-# ============================================================
-# DUPLICIDADE
-# ============================================================
+def buscar_historico(limite=100):
+    conn = get_conn()
+    df = pd.read_sql_query(
+        """
+        SELECT
+            id, side, entry_time, entry_price, stop_price, target_price,
+            exit_time, exit_price, pnl_pct, result, score, regime,
+            signal_time, signal, entry_reason
+        FROM trades
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(limite,),
+    )
+    conn.close()
+    return df
+
 
 def entrada_ja_registrada(signal_time):
-
-    conn = conectar()
-
-    resultado = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM trades
-        WHERE signal_time = ?
-        """,
-        (signal_time,)
-    ).fetchone()
-
+    conn = get_conn()
+    cur = conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE signal_time = ?",
+        (str(signal_time),),
+    )
+    existe = cur.fetchone()[0] > 0
     conn.close()
-
-    if resultado is None:
-        return False
-
-    return resultado[0] > 0
+    return existe
 
 
-# ============================================================
-# REGISTRAR OPERAÇÃO
-# ============================================================
+def validar_plano(side, entrada, stop, target):
+    """Validação de segurança antes de gravar a operação."""
+    entrada = float(entrada)
+    stop = float(stop)
+    target = float(target)
+
+    if not all(np.isfinite([entrada, stop, target])):
+        return False, "Preço de entrada, stop ou alvo inválido."
+
+    if side == "COMPRA":
+        if not (stop < entrada < target):
+            return False, (
+                f"Plano inválido para COMPRA: esperado STOP < ENTRADA < ALVO, "
+                f"mas recebeu {stop:.2f} < {entrada:.2f} < {target:.2f}."
+            )
+    elif side == "VENDA":
+        if not (target < entrada < stop):
+            return False, (
+                f"Plano inválido para VENDA: esperado ALVO < ENTRADA < STOP, "
+                f"mas recebeu {target:.2f} < {entrada:.2f} < {stop:.2f}."
+            )
+    else:
+        return False, f"Lado inválido: {side}"
+
+    return True, "Plano válido."
+
 
 def registrar_trade(
     side,
@@ -269,758 +198,334 @@ def registrar_trade(
     score,
     regime,
     signal_time,
-    notes=""
+    row,
+    imbalance,
+    score_compra,
+    score_venda,
+    signal,
+    entry_reason,
+    notes="",
 ):
+    # 3) Segurança: nunca grava uma operação com stop/alvo invertidos.
+    valido, mensagem = validar_plano(side, entry_price, stop_price, target_price)
+    if not valido:
+        raise ValueError(mensagem)
 
-    conn = conectar()
-
-    entry_time = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
+    conn = get_conn()
     conn.execute(
         """
         INSERT INTO trades (
-
-            symbol,
-            side,
-
-            entry_time,
-            entry_price,
-
-            stop_price,
-            target_price,
-
-            exit_time,
-            exit_price,
-
-            pnl_pct,
-            result,
-
-            score,
-            regime,
-
-            notes,
-            signal_time
-
-        )
-
-        VALUES (
-            ?, ?,
-            ?, ?,
-            ?, ?,
-            NULL, NULL,
-            NULL, NULL,
-            ?, ?,
-            ?, ?
+            symbol, side, entry_time, entry_price, stop_price, target_price,
+            exit_time, exit_price, pnl_pct, result, score, regime, notes,
+            signal_time,
+            ema20, ema50, ema200, rsi, atr, ret_1, ret_3, ret_12, ret_48,
+            volatility, vol_z, volume_ratio, volume_z, vwap, cvd_delta,
+            orderbook_imbalance, score_compra, score_venda, signal, entry_reason
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?,
+            NULL, NULL, NULL, NULL, ?, ?, ?,
+            ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?
         )
         """,
         (
             SYMBOL,
             side,
-
-            entry_time,
+            agora(),
             float(entry_price),
-
             float(stop_price),
             float(target_price),
-
             float(score),
             regime,
-
             notes,
-            signal_time
-        )
+            str(signal_time),
+            float(row["EMA20"]),
+            float(row["EMA50"]),
+            float(row["EMA200"]),
+            float(row["RSI"]),
+            float(row["ATR"]),
+            float(row["ret_1"]),
+            float(row["ret_3"]),
+            float(row["ret_12"]),
+            float(row["ret_48"]),
+            float(row["volatility"]),
+            float(row["vol_z"]),
+            float(row["volume_ratio"]),
+            float(row["volume_z"]),
+            float(row["VWAP"]),
+            float(row["cvd_delta"]),
+            float(imbalance),
+            float(score_compra),
+            float(score_venda),
+            signal,
+            entry_reason,
+        ),
     )
-
     conn.commit()
+    trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.close()
+    return trade_id
 
 
-# ============================================================
-# FECHAR OPERAÇÃO
-# ============================================================
-
-def fechar_trade(
-    trade_id,
-    exit_price,
-    result
-):
-
-    conn = conectar()
-
-    trade = conn.execute(
-        """
-        SELECT
-            side,
-            entry_price
-        FROM trades
-        WHERE id = ?
-        """,
-        (trade_id,)
+def fechar_trade(trade_id, exit_price, result):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT side, entry_price FROM trades WHERE id = ?",
+        (int(trade_id),),
     ).fetchone()
 
-    if trade is None:
-
+    if row is None:
         conn.close()
         return
 
-    side = trade[0]
-
-    entry_price = float(
-        trade[1]
-    )
-
-    exit_price = float(
-        exit_price
-    )
+    side, entry_price = row
+    entry_price = float(entry_price)
+    exit_price = float(exit_price)
 
     if side == "COMPRA":
-
-        pnl_pct = (
-            (exit_price / entry_price) - 1
-        ) * 100
-
+        pnl_pct = ((exit_price / entry_price) - 1) * 100
     else:
-
-        pnl_pct = (
-            (entry_price / exit_price) - 1
-        ) * 100
-
-    exit_time = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+        pnl_pct = ((entry_price / exit_price) - 1) * 100
 
     conn.execute(
         """
         UPDATE trades
-
-        SET
-            exit_time = ?,
-            exit_price = ?,
-            pnl_pct = ?,
-            result = ?
-
+        SET exit_time = ?, exit_price = ?, pnl_pct = ?, result = ?
         WHERE id = ?
         """,
-        (
-            exit_time,
-            exit_price,
-            pnl_pct,
-            result,
-            trade_id
-        )
+        (agora(), exit_price, pnl_pct, result, int(trade_id)),
     )
-
     conn.commit()
     conn.close()
 
 
+def monitorar_operacoes(preco_atual, tempo_maximo):
+    abertas = buscar_operacoes_abertas()
+    if abertas.empty:
+        return []
+
+    fechadas = []
+    agora_dt = datetime.now()
+
+    for _, trade in abertas.iterrows():
+        trade_id = int(trade["id"])
+        side = trade["side"]
+        entry_time = pd.to_datetime(trade["entry_time"])
+        minutos_aberto = (agora_dt - entry_time.to_pydatetime()).total_seconds() / 60
+
+        resultado = None
+
+        if side == "COMPRA":
+            if preco_atual <= float(trade["stop_price"]):
+                resultado = "PERDA"
+            elif preco_atual >= float(trade["target_price"]):
+                resultado = "GANHO"
+        elif side == "VENDA":
+            if preco_atual >= float(trade["stop_price"]):
+                resultado = "PERDA"
+            elif preco_atual <= float(trade["target_price"]):
+                resultado = "GANHO"
+
+        if resultado is None and minutos_aberto >= tempo_maximo:
+            resultado = "TIMEOUT"
+
+        if resultado:
+            fechar_trade(trade_id, preco_atual, resultado)
+            fechadas.append((trade_id, resultado))
+
+    return fechadas
+
 # ============================================================
 # BINANCE
 # ============================================================
-
+@st.cache_data(ttl=4, show_spinner=False)
 def buscar_klines():
+    url = f"{BINANCE_API}/api/v3/klines"
+    params = {"symbol": SYMBOL, "interval": INTERVAL, "limit": KLINE_LIMIT}
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
 
-    url = (
-        f"{BINANCE_API}/api/v3/klines"
-    )
-
-    params = {
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "limit": KLINE_LIMIT
-    }
-
-    response = requests.get(
-        url,
-        params=params,
-        timeout=10
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    colunas = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_volume",
-        "trades",
-        "taker_buy_base",
-        "taker_buy_quote",
-        "ignore"
+    cols = [
+        "open_time", "Open", "High", "Low", "Close", "Volume",
+        "close_time", "quote_volume", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore",
     ]
+    df = pd.DataFrame(data, columns=cols)
 
-    df = pd.DataFrame(
-        data,
-        columns=colunas
-    )
-
-    numeric_cols = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_volume"
-    ]
-
+    numeric_cols = ["Open", "High", "Low", "Close", "Volume", "quote_volume"]
     for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce"
-        )
-
-    df["open_time"] = pd.to_datetime(
-        df["open_time"],
-        unit="ms"
-    )
-
-    df["close_time"] = pd.to_datetime(
-        df["close_time"],
-        unit="ms"
-    )
-
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
     return df
 
 
+@st.cache_data(ttl=2, show_spinner=False)
 def buscar_preco():
-
-    url = (
-        f"{BINANCE_API}/api/v3/ticker/price"
-    )
-
-    response = requests.get(
-        url,
-        params={"symbol": SYMBOL},
-        timeout=10
-    )
-
-    response.raise_for_status()
-
-    return float(
-        response.json()["price"]
-    )
+    url = f"{BINANCE_API}/api/v3/ticker/price"
+    r = requests.get(url, params={"symbol": SYMBOL}, timeout=10)
+    r.raise_for_status()
+    return float(r.json()["price"])
 
 
+@st.cache_data(ttl=2, show_spinner=False)
 def buscar_orderbook():
+    url = f"{BINANCE_API}/api/v3/depth"
+    r = requests.get(url, params={"symbol": SYMBOL, "limit": 50}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
 
-    url = (
-        f"{BINANCE_API}/api/v3/depth"
-    )
-
-    response = requests.get(
-        url,
-        params={
-            "symbol": SYMBOL,
-            "limit": 50
-        },
-        timeout=10
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    bids = sum(
-        float(item[1])
-        for item in data["bids"]
-    )
-
-    asks = sum(
-        float(item[1])
-        for item in data["asks"]
-    )
+    bids = sum(float(price) * float(qty) for price, qty in data.get("bids", []))
+    asks = sum(float(price) * float(qty) for price, qty in data.get("asks", []))
 
     total = bids + asks
-
-    if total == 0:
-
-        imbalance = 0
-
-    else:
-
-        imbalance = (
-            (bids - asks) / total
-        )
+    imbalance = (bids - asks) / total if total > 0 else 0.0
 
     return {
         "bids": bids,
         "asks": asks,
-        "imbalance": imbalance
+        "imbalance": imbalance,
     }
-
 
 # ============================================================
 # INDICADORES
 # ============================================================
-
 def calcular_indicadores(df):
-
     df = df.copy()
 
-    df["ret_1"] = (
-        df["close"].pct_change(1)
-    )
+    df["ret_1"] = df["Close"].pct_change(1)
+    df["ret_3"] = df["Close"].pct_change(3)
+    df["ret_12"] = df["Close"].pct_change(12)
+    df["ret_48"] = df["Close"].pct_change(48)
 
-    df["ret_3"] = (
-        df["close"].pct_change(3)
-    )
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
-    df["ret_12"] = (
-        df["close"].pct_change(12)
-    )
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["RSI"] = 100 - (100 / (1 + rs))
 
-    df["ret_48"] = (
-        df["close"].pct_change(48)
-    )
-
-    df["EMA20"] = (
-        df["close"]
-        .ewm(
-            span=20,
-            adjust=False
-        )
-        .mean()
-    )
-
-    df["EMA50"] = (
-        df["close"]
-        .ewm(
-            span=50,
-            adjust=False
-        )
-        .mean()
-    )
-
-    df["EMA200"] = (
-        df["close"]
-        .ewm(
-            span=200,
-            adjust=False
-        )
-        .mean()
-    )
-
-    # RSI
-    delta = df["close"].diff()
-
-    gain = delta.clip(
-        lower=0
-    )
-
-    loss = -delta.clip(
-        upper=0
-    )
-
-    avg_gain = (
-        gain
-        .rolling(14)
-        .mean()
-    )
-
-    avg_loss = (
-        loss
-        .rolling(14)
-        .mean()
-    )
-
-    rs = (
-        avg_gain /
-        avg_loss.replace(
-            0,
-            np.nan
-        )
-    )
-
-    df["RSI"] = (
-        100 -
-        (100 / (1 + rs))
-    )
-
-    # ATR
-    high_low = (
-        df["high"] -
-        df["low"]
-    )
-
-    high_close = (
-        df["high"] -
-        df["close"].shift()
-    ).abs()
-
-    low_close = (
-        df["low"] -
-        df["close"].shift()
-    ).abs()
-
+    prev_close = df["Close"].shift(1)
     tr = pd.concat(
         [
-            high_low,
-            high_close,
-            low_close
+            df["High"] - df["Low"],
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
         ],
-        axis=1
+        axis=1,
     ).max(axis=1)
+    df["ATR"] = tr.rolling(14).mean()
 
-    df["ATR"] = (
-        tr
-        .rolling(14)
-        .mean()
-    )
+    df["volatility"] = df["ret_1"].rolling(48).std()
+    vol_mean = df["Volume"].rolling(100).mean()
+    vol_std = df["Volume"].rolling(100).std()
+    df["vol_z"] = (df["Volume"] - vol_mean) / vol_std.replace(0, np.nan)
 
-    # Volatilidade
-    df["volatility"] = (
-        df["ret_1"]
-        .rolling(48)
-        .std()
-    )
+    df["volume_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
+    vr_mean = df["volume_ratio"].rolling(20).mean()
+    vr_std = df["volume_ratio"].rolling(20).std()
+    df["volume_z"] = (df["volume_ratio"] - vr_mean) / vr_std.replace(0, np.nan)
 
-    vol_mean = (
-        df["volatility"]
-        .rolling(100)
-        .mean()
-    )
-
-    vol_std = (
-        df["volatility"]
-        .rolling(100)
-        .std()
-    )
-
-    df["vol_z"] = (
-        (
-            df["volatility"] -
-            vol_mean
-        ) /
-        vol_std.replace(
-            0,
-            np.nan
-        )
-    )
-
-    # Volume
-    volume_mean = (
-        df["volume"]
-        .rolling(20)
-        .mean()
-    )
-
-    volume_std = (
-        df["volume"]
-        .rolling(20)
-        .std()
-    )
-
-    df["volume_ratio"] = (
-        df["volume"] /
-        volume_mean.replace(
-            0,
-            np.nan
-        )
-    )
-
-    df["volume_z"] = (
-        (
-            df["volume"] -
-            volume_mean
-        ) /
-        volume_std.replace(
-            0,
-            np.nan
-        )
-    )
-
-    # VWAP
-    typical_price = (
-        df["high"] +
-        df["low"] +
-        df["close"]
-    ) / 3
-
+    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
     df["VWAP"] = (
-        (
-            typical_price *
-            df["volume"]
-        )
-        .rolling(48)
-        .sum()
-        /
-        df["volume"]
-        .rolling(48)
-        .sum()
-        .replace(
-            0,
-            np.nan
-        )
+        (typical_price * df["Volume"]).rolling(48).sum()
+        / df["Volume"].rolling(48).sum()
     )
 
-    # CVD aproximado
-    direction = np.sign(
-        df["close"].diff()
-    )
-
-    df["cvd"] = (
-        direction *
-        df["volume"]
-    ).cumsum()
-
-    df["cvd_delta"] = (
-        df["cvd"].diff()
-    )
+    direction = np.sign(df["Close"].diff()).fillna(0)
+    df["cvd"] = (direction * df["Volume"]).cumsum()
+    df["cvd_delta"] = df["cvd"].diff()
 
     return df
 
-
 # ============================================================
-# SCORE
+# SCORE / SINAL
 # ============================================================
-
-def gerar_score(
-    row,
-    imbalance
-):
-
+def gerar_score(row, imbalance):
     compra = 0
     venda = 0
-
     fatores_compra = []
     fatores_venda = []
 
-    # EMA 20 / 50
+    def add_compra(pontos, texto):
+        nonlocal compra
+        compra += pontos
+        fatores_compra.append(f"{texto} (+{pontos})")
+
+    def add_venda(pontos, texto):
+        nonlocal venda
+        venda += pontos
+        fatores_venda.append(f"{texto} (+{pontos})")
+
     if row["EMA20"] > row["EMA50"]:
-
-        compra += 15
-
-        fatores_compra.append(
-            ("EMA20 acima da EMA50", 15)
-        )
-
+        add_compra(15, "EMA20 > EMA50")
     else:
+        add_venda(15, "EMA20 <= EMA50")
 
-        venda += 15
-
-        fatores_venda.append(
-            ("EMA20 abaixo da EMA50", 15)
-        )
-
-    # EMA 200
-    if row["close"] > row["EMA200"]:
-
-        compra += 10
-
-        fatores_compra.append(
-            ("Preço acima da EMA200", 10)
-        )
-
+    if row["Close"] > row["EMA200"]:
+        add_compra(10, "Preço > EMA200")
     else:
+        add_venda(10, "Preço <= EMA200")
 
-        venda += 10
-
-        fatores_venda.append(
-            ("Preço abaixo da EMA200", 10)
-        )
-
-    # Momentum 12
     if row["ret_12"] > 0:
-
-        compra += 10
-
-        fatores_compra.append(
-            ("Momentum positivo - 12 períodos", 10)
-        )
-
+        add_compra(10, "Retorno 12 candles > 0")
     else:
+        add_venda(10, "Retorno 12 candles <= 0")
 
-        venda += 10
-
-        fatores_venda.append(
-            ("Momentum negativo - 12 períodos", 10)
-        )
-
-    # Momentum 48
     if row["ret_48"] > 0:
-
-        compra += 10
-
-        fatores_compra.append(
-            ("Momentum positivo - 48 períodos", 10)
-        )
-
+        add_compra(10, "Retorno 48 candles > 0")
     else:
+        add_venda(10, "Retorno 48 candles <= 0")
 
-        venda += 10
+    if 50 <= row["RSI"] <= 70:
+        add_compra(10, "RSI entre 50 e 70")
+    elif 30 <= row["RSI"] < 45:
+        add_venda(10, "RSI entre 30 e 45")
+    elif 45 <= row["RSI"] < 50:
+        add_venda(5, "RSI entre 45 e 50")
 
-        fatores_venda.append(
-            ("Momentum negativo - 48 períodos", 10)
-        )
+    if row["volume_z"] > 1 and row["ret_1"] > 0:
+        add_compra(10, "Volume Z > 1 com retorno positivo")
+    elif row["volume_z"] > 1 and row["ret_1"] < 0:
+        add_venda(10, "Volume Z > 1 com retorno negativo")
 
-    # RSI
-    rsi = row["RSI"]
-
-    if 50 <= rsi <= 70:
-
-        compra += 10
-
-        fatores_compra.append(
-            (
-                f"RSI favorável ({rsi:.1f})",
-                10
-            )
-        )
-
-    elif 30 <= rsi <= 45:
-
-        venda += 10
-
-        fatores_venda.append(
-            (
-                f"RSI favorável ({rsi:.1f})",
-                10
-            )
-        )
-
-    elif 45 < rsi < 50:
-
-        venda += 5
-
-        fatores_venda.append(
-            (
-                f"RSI vendedor ({rsi:.1f})",
-                5
-            )
-        )
-
-    # Volume
-    if (
-        row["volume_z"] > 1
-        and row["ret_1"] > 0
-    ):
-
-        compra += 10
-
-        fatores_compra.append(
-            (
-                "Volume forte + candle comprador",
-                10
-            )
-        )
-
-    elif (
-        row["volume_z"] > 1
-        and row["ret_1"] < 0
-    ):
-
-        venda += 10
-
-        fatores_venda.append(
-            (
-                "Volume forte + candle vendedor",
-                10
-            )
-        )
-
-    # VWAP
-    if row["close"] > row["VWAP"]:
-
-        compra += 10
-
-        fatores_compra.append(
-            ("Preço acima da VWAP", 10)
-        )
-
+    if row["Close"] > row["VWAP"]:
+        add_compra(10, "Preço > VWAP")
     else:
+        add_venda(10, "Preço <= VWAP")
 
-        venda += 10
-
-        fatores_venda.append(
-            ("Preço abaixo da VWAP", 10)
-        )
-
-    # CVD
     if row["cvd_delta"] > 0:
-
-        compra += 10
-
-        fatores_compra.append(
-            ("CVD positivo", 10)
-        )
-
+        add_compra(10, "CVD delta > 0")
     elif row["cvd_delta"] < 0:
+        add_venda(10, "CVD delta < 0")
 
-        venda += 10
-
-        fatores_venda.append(
-            ("CVD negativo", 10)
-        )
-
-    # Order Book
     if imbalance > 0.10:
-
-        compra += 10
-
-        fatores_compra.append(
-            (
-                f"Order Book comprador ({imbalance:.2f})",
-                10
-            )
-        )
-
+        add_compra(10, "Order book imbalance > 0,10")
     elif imbalance < -0.10:
+        add_venda(10, "Order book imbalance < -0,10")
 
-        venda += 10
-
-        fatores_venda.append(
-            (
-                f"Order Book vendedor ({imbalance:.2f})",
-                10
-            )
-        )
-
-    # Regime
-    if (
-        row["EMA20"] > row["EMA50"]
-        and row["close"] > row["EMA200"]
-    ):
-
-        regime = "ALTA"
-
-    elif (
-        row["EMA20"] < row["EMA50"]
-        and row["close"] < row["EMA200"]
-    ):
-
-        regime = "BAIXA"
-
-    else:
-
-        regime = "LATERAL"
-
-    # Sinal
-    if (
-        compra >= 65
-        and compra > venda + 10
-    ):
-
+    if compra >= 65 and compra > venda + 10:
         sinal = "COMPRA"
-
-    elif (
-        venda >= 65
-        and venda > compra + 10
-    ):
-
+    elif venda >= 65 and venda > compra + 10:
         sinal = "VENDA"
-
     else:
-
         sinal = "AGUARDAR"
+
+    if row["EMA20"] > row["EMA50"] and row["Close"] > row["EMA200"]:
+        regime = "ALTA"
+    elif row["EMA20"] < row["EMA50"] and row["Close"] < row["EMA200"]:
+        regime = "BAIXA"
+    else:
+        regime = "LATERAL"
 
     return (
         compra,
@@ -1028,350 +533,93 @@ def gerar_score(
         sinal,
         regime,
         fatores_compra,
-        fatores_venda
+        fatores_venda,
     )
 
 
-# ============================================================
-# STOP / ALVO
-# ============================================================
-
-def calcular_plano(
+def montar_motivo_entrada(
     side,
-    preco,
-    atr
+    score_compra,
+    score_venda,
+    regime,
+    fatores_compra,
+    fatores_venda,
 ):
+    fatores = fatores_compra if side == "COMPRA" else fatores_venda
+    score = score_compra if side == "COMPRA" else score_venda
 
+    partes = [
+        side,
+        f"Score {score:.0f}",
+        f"Regime {regime}",
+    ]
+    partes.extend(fatores)
+    return " | ".join(partes)
+
+
+def calcular_plano(side, preco, atr):
     if side == "COMPRA":
-
-        stop = (
-            preco -
-            atr * ATR_STOP_MULTIPLIER
-        )
-
-        target = (
-            preco +
-            atr * ATR_TARGET_MULTIPLIER
-        )
-
+        stop = preco - atr * ATR_STOP_MULTIPLIER
+        target = preco + atr * ATR_TARGET_MULTIPLIER
+    elif side == "VENDA":
+        stop = preco + atr * ATR_STOP_MULTIPLIER
+        target = preco - atr * ATR_TARGET_MULTIPLIER
     else:
+        raise ValueError("Side inválido para cálculo do plano.")
 
-        stop = (
-            preco +
-            atr * ATR_STOP_MULTIPLIER
-        )
-
-        target = (
-            preco -
-            atr * ATR_TARGET_MULTIPLIER
-        )
+    valido, mensagem = validar_plano(side, preco, stop, target)
+    if not valido:
+        raise ValueError(mensagem)
 
     return stop, target
 
-
 # ============================================================
-# MONITORAMENTO DAS OPERAÇÕES
+# INTERFACE
 # ============================================================
+st.title("₿ BTC Quant Trader — Paper Trading v2")
+st.caption(
+    "BTC/USDT • candles de 5 minutos • dados públicos Binance • sem ordens reais • banco: btc_trader_v2.db"
+)
 
-def monitorar_operacoes(
-    preco_atual,
-    tempo_maximo
-):
-
-    abertas = buscar_operacoes_abertas()
-
-    eventos = []
-
-    agora = datetime.now()
-
-    for _, trade in abertas.iterrows():
-
-        trade_id = int(
-            trade["id"]
-        )
-
-        side = trade["side"]
-
-        entrada = float(
-            trade["entry_price"]
-        )
-
-        stop = float(
-            trade["stop_price"]
-        )
-
-        alvo = float(
-            trade["target_price"]
-        )
-
-        # ----------------------------------------------------
-        # TEMPO DA OPERAÇÃO
-        # ----------------------------------------------------
-
-        try:
-
-            entrada_data = pd.to_datetime(
-                trade["entry_time"]
-            ).to_pydatetime()
-
-            minutos_aberto = (
-                agora -
-                entrada_data
-            ).total_seconds() / 60
-
-        except Exception:
-
-            minutos_aberto = 0
-
-        # ----------------------------------------------------
-        # STOP / ALVO
-        # ----------------------------------------------------
-
-        resultado = None
-
-        if side == "COMPRA":
-
-            if preco_atual <= stop:
-
-                resultado = "PERDA"
-
-            elif preco_atual >= alvo:
-
-                resultado = "GANHO"
-
-        else:
-
-            if preco_atual >= stop:
-
-                resultado = "PERDA"
-
-            elif preco_atual <= alvo:
-
-                resultado = "GANHO"
-
-        # ----------------------------------------------------
-        # TEMPO MÁXIMO
-        # ----------------------------------------------------
-
-        if (
-            resultado is None
-            and minutos_aberto >= tempo_maximo
-        ):
-
-            resultado = "TEMPO ESGOTADO"
-
-        # ----------------------------------------------------
-        # FECHAMENTO
-        # ----------------------------------------------------
-
-        if resultado is not None:
-
-            fechar_trade(
-                trade_id,
-                preco_atual,
-                resultado
-            )
-
-            eventos.append(
-                f"Operação #{trade_id}: "
-                f"{resultado}"
-            )
-
-    return eventos
-
-
-# ============================================================
-# PERFORMANCE
-# ============================================================
-
-def buscar_performance():
-
-    conn = conectar()
-
-    df = pd.read_sql_query(
-        """
-        SELECT *
-        FROM trades
-        WHERE exit_time IS NOT NULL
-        """,
-        conn
-    )
-
-    conn.close()
-
-    if df.empty:
-
-        return {
-            "total": 0,
-            "ganhos": 0,
-            "perdas": 0,
-            "tempo": 0,
-            "wr": 0,
-            "pnl": 0
-        }
-
-    ganhos = (
-        df["result"] == "GANHO"
-    ).sum()
-
-    perdas = (
-        df["result"] == "PERDA"
-    ).sum()
-
-    tempo = (
-        df["result"] == "TEMPO ESGOTADO"
-    ).sum()
-
-    total = len(df)
-
-    wr = (
-        ganhos / total * 100
-        if total > 0
-        else 0
-    )
-
-    pnl = (
-        df["pnl_pct"]
-        .fillna(0)
-        .sum()
-    )
-
-    return {
-        "total": total,
-        "ganhos": int(ganhos),
-        "perdas": int(perdas),
-        "tempo": int(tempo),
-        "wr": wr,
-        "pnl": pnl
-    }
-
-
-# ============================================================
-# INICIALIZAÇÃO
-# ============================================================
-
-criar_banco()
-
-
-if "ultimo_evento" not in st.session_state:
-
-    st.session_state["ultimo_evento"] = ""
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
+# Sidebar
 with st.sidebar:
-
-    st.header("⚙️ Configuração")
-
+    st.header("Configuração")
     max_operacoes = st.number_input(
         "Máximo de operações abertas",
         min_value=1,
-        max_value=20,
+        max_value=50,
         value=5,
-        step=1
+        step=1,
     )
-
     tempo_maximo = st.number_input(
-        "Tempo máximo da operação (minutos)",
+        "Tempo máximo por operação (min)",
         min_value=5,
         max_value=1440,
         value=60,
-        step=5
+        step=5,
     )
-
     st.divider()
-
-    st.write(
-        "### Estratégia"
-    )
-
-    st.write(
-        f"Intervalo: **{INTERVAL}**"
-    )
-
-    st.write(
-        f"Atualização: **{AUTO_REFRESH_SECONDS}s**"
-    )
-
-    st.write(
-        "Modo: **PAPER TRADING**"
-    )
-
-    st.divider()
-
-    st.caption(
-        "O robô não envia ordens reais."
-    )
-
-
-# ============================================================
-# TÍTULO
-# ============================================================
-
-st.title(
-    "₿ BTC Quant Trader"
-)
-
-st.caption(
-    "Monitoramento quantitativo automático • "
-    "BTC/USDT • Paper Trading"
-)
-
-st.success(
-    "🤖 ROBÔ ATIVO — MODO PAPER TRADING"
-)
-
+    st.write(f"**Stop:** {ATR_STOP_MULTIPLIER:.1f} × ATR")
+    st.write(f"**Alvo:** {ATR_TARGET_MULTIPLIER:.1f} × ATR")
+    st.write(f"**Refresh:** {AUTO_REFRESH_SECONDS}s")
+    st.write("**Entrada:** somente sinal confirmado")
+    st.write("**Banco:** `btc_trader_v2.db`")
 
 # ============================================================
 # MONITORAMENTO
 # ============================================================
-
-@st.fragment(
-    run_every=AUTO_REFRESH_SECONDS
-)
+@st.fragment(run_every=AUTO_REFRESH_SECONDS)
 def monitor():
-
     try:
-
-        # ----------------------------------------------------
-        # DADOS
-        # ----------------------------------------------------
-
         df = buscar_klines()
-
         preco_atual = buscar_preco()
-
         orderbook = buscar_orderbook()
 
         df = calcular_indicadores(df)
 
-        if len(df) < 250:
-
-            st.warning(
-                "Aguardando histórico suficiente..."
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # ÚLTIMO CANDLE FECHADO
-        # ----------------------------------------------------
-
+        # Último candle FECHADO. O último registro pode ainda estar em formação.
         row = df.iloc[-2]
-
-        signal_time = (
-            row["close_time"]
-            .strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        )
-
-        # ----------------------------------------------------
-        # SCORE
-        # ----------------------------------------------------
+        signal_time = row["close_time"]
 
         (
             score_compra,
@@ -1379,85 +627,41 @@ def monitor():
             sinal,
             regime,
             fatores_compra,
-            fatores_venda
-        ) = gerar_score(
-            row,
-            orderbook["imbalance"]
+            fatores_venda,
+        ) = gerar_score(row, orderbook["imbalance"])
+
+        # 4) Auditoria: tudo usado para gerar o sinal é salvo na entrada.
+        motivo_entrada = montar_motivo_entrada(
+            sinal,
+            score_compra,
+            score_venda,
+            regime,
+            fatores_compra,
+            fatores_venda,
         )
 
-        # ----------------------------------------------------
-        # MONITORAR OPERAÇÕES
-        # ----------------------------------------------------
+        # Monitora operações já abertas antes de procurar nova entrada.
+        fechadas = monitorar_operacoes(preco_atual, tempo_maximo)
+        if fechadas:
+            st.toast(
+                " | ".join(f"#{trade_id}: {resultado}" for trade_id, resultado in fechadas)
+            )
 
-        eventos = monitorar_operacoes(
-            preco_atual,
-            tempo_maximo
-        )
+        abertas = buscar_operacoes_abertas()
+        quantidade_abertas = len(abertas)
 
-        if eventos:
+        # Entrada automática
+        if quantidade_abertas < int(max_operacoes):
+            if sinal in ["COMPRA", "VENDA"]:
+                if not entrada_ja_registrada(signal_time):
+                    atr = float(row["ATR"])
 
-            st.session_state[
-                "ultimo_evento"
-            ] = " | ".join(eventos)
+                    if np.isfinite(atr) and atr > 0:
+                        entrada = float(preco_atual)
+                        stop, alvo = calcular_plano(sinal, entrada, atr)
+                        score = score_compra if sinal == "COMPRA" else score_venda
 
-        # ----------------------------------------------------
-        # OPERAÇÕES ABERTAS
-        # ----------------------------------------------------
-
-        abertas = (
-            buscar_operacoes_abertas()
-        )
-
-        quantidade_abertas = len(
-            abertas
-        )
-
-        # ----------------------------------------------------
-        # ENTRADA AUTOMÁTICA
-        # ----------------------------------------------------
-
-        if (
-            quantidade_abertas
-            < max_operacoes
-        ):
-
-            if sinal in [
-                "COMPRA",
-                "VENDA"
-            ]:
-
-                if not entrada_ja_registrada(
-                    signal_time
-                ):
-
-                    atr = float(
-                        row["ATR"]
-                    )
-
-                    if (
-                        np.isfinite(atr)
-                        and atr > 0
-                    ):
-
-                        entrada = (
-                            preco_atual
-                        )
-
-                        stop, alvo = (
-                            calcular_plano(
-                                sinal,
-                                entrada,
-                                atr
-                            )
-                        )
-
-                        score = (
-                            score_compra
-                            if sinal == "COMPRA"
-                            else score_venda
-                        )
-
-                        registrar_trade(
+                        trade_id = registrar_trade(
                             side=sinal,
                             entry_price=entrada,
                             stop_price=stop,
@@ -1465,735 +669,214 @@ def monitor():
                             score=score,
                             regime=regime,
                             signal_time=signal_time,
-                            notes=(
-                                "Entrada automática "
-                                "por sinal confirmado."
-                            )
+                            row=row,
+                            imbalance=orderbook["imbalance"],
+                            score_compra=score_compra,
+                            score_venda=score_venda,
+                            signal=sinal,
+                            entry_reason=motivo_entrada,
+                            notes="Entrada automática por sinal confirmado. Snapshot completo salvo para auditoria.",
                         )
 
-                        st.session_state[
-                            "ultimo_evento"
-                        ] = (
-                            f"Nova operação: "
-                            f"{sinal} "
-                            f"#{quantidade_abertas + 1}"
+                        st.success(
+                            f"Nova operação #{trade_id}: {sinal} | "
+                            f"Entrada ${entrada:,.2f} | Score {score:.0f}"
                         )
 
-                        abertas = (
-                            buscar_operacoes_abertas()
-                        )
+                        # Recarrega para refletir a nova operação imediatamente.
+                        abertas = buscar_operacoes_abertas()
+                        quantidade_abertas = len(abertas)
 
-                        quantidade_abertas = len(
-                            abertas
-                        )
-
-        # ====================================================
-        # STATUS PRINCIPAL
-        # ====================================================
+        # --------------------------------------------------------
+        # Painel principal
+        # --------------------------------------------------------
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("BTC", f"${preco_atual:,.2f}")
+        c2.metric("Sinal", sinal)
+        c3.metric("Score COMPRA", f"{score_compra:.0f}")
+        c4.metric("Score VENDA", f"{score_venda:.0f}")
+        c5.metric("Regime", regime)
 
         st.divider()
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        # Sinal e plano
+        left, right = st.columns([1.15, 1])
 
-        with c1:
+        with left:
+            st.subheader("Sinal atual")
+            if sinal == "COMPRA":
+                st.success("🟢 COMPRA")
+            elif sinal == "VENDA":
+                st.error("🔴 VENDA")
+            else:
+                st.info("🟡 AGUARDAR")
 
-            st.metric(
-                "Preço BTC",
-                f"${preco_atual:,.2f}"
-            )
+            st.write(f"**Candle analisado:** {signal_time}")
+            st.write(f"**Preço do candle:** ${float(row['Close']):,.2f}")
+            st.write(f"**Preço atual:** ${preco_atual:,.2f}")
+            st.write(f"**Order book imbalance:** {orderbook['imbalance']:+.4f}")
 
-        with c2:
-
-            st.metric(
-                "Score Compra",
-                f"{score_compra}/100"
-            )
-
-        with c3:
-
-            st.metric(
-                "Score Venda",
-                f"{score_venda}/100"
-            )
-
-        with c4:
-
-            st.metric(
-                "Regime",
-                regime
-            )
-
-        with c5:
-
-            st.metric(
-                "Operações",
-                f"{quantidade_abertas}/{max_operacoes}"
-            )
-
-        # ====================================================
-        # DECISÃO
-        # ====================================================
-
-        st.subheader(
-            "🎯 DECISÃO DO ROBÔ"
-        )
-
-        if sinal == "COMPRA":
-
-            st.success(
-                f"🟢 COMPRA BTC — "
-                f"Score {score_compra}/100"
-            )
-
-        elif sinal == "VENDA":
-
-            st.error(
-                f"🔴 VENDA BTC — "
-                f"Score {score_venda}/100"
-            )
-
-        else:
-
-            st.warning(
-                f"🟡 AGUARDAR — "
-                f"Compra {score_compra} | "
-                f"Venda {score_venda}"
-            )
-
-        # ====================================================
-        # EVENTO
-        # ====================================================
-
-        if st.session_state[
-            "ultimo_evento"
-        ]:
-
-            st.info(
-                "📌 " +
-                st.session_state[
-                    "ultimo_evento"
-                ]
-            )
-
-        # ====================================================
-        # OPERAÇÕES ABERTAS
-        # ====================================================
-
-        st.subheader(
-            f"📌 OPERAÇÕES ABERTAS "
-            f"({quantidade_abertas}/{max_operacoes})"
-        )
-
-        if not abertas.empty:
-
-            tabela = []
-
-            for _, trade in abertas.iterrows():
-
-                entrada = float(
-                    trade["entry_price"]
-                )
-
-                stop = float(
-                    trade["stop_price"]
-                )
-
-                alvo = float(
-                    trade["target_price"]
-                )
-
-                side = trade["side"]
-
-                if side == "COMPRA":
-
-                    pnl = (
-                        (
-                            preco_atual /
-                            entrada
-                        ) - 1
-                    ) * 100
-
-                else:
-
-                    pnl = (
-                        (
-                            entrada /
-                            preco_atual
-                        ) - 1
-                    ) * 100
-
+            if sinal in ["COMPRA", "VENDA"]:
                 try:
+                    stop_view, alvo_view = calcular_plano(sinal, preco_atual, float(row["ATR"]))
+                    st.write(f"**Stop:** ${stop_view:,.2f}")
+                    st.write(f"**Alvo:** ${alvo_view:,.2f}")
+                except ValueError as exc:
+                    st.warning(str(exc))
 
-                    entrada_data = pd.to_datetime(
-                        trade["entry_time"]
-                    )
+        with right:
+            st.subheader("Fatores do sinal")
+            if sinal == "COMPRA":
+                for fator in fatores_compra:
+                    st.write("•", fator)
+            elif sinal == "VENDA":
+                for fator in fatores_venda:
+                    st.write("•", fator)
+            else:
+                st.write("Nenhum lado atingiu os critérios de entrada.")
 
-                    minutos = int(
-                        (
-                            pd.Timestamp.now()
-                            - entrada_data
-                        ).total_seconds()
-                        / 60
-                    )
+        st.divider()
 
-                except Exception:
+        # Operações abertas
+        st.subheader(f"Operações abertas ({quantidade_abertas}/{int(max_operacoes)})")
 
-                    minutos = 0
-
-                tabela.append(
-                    {
-                        "ID": int(
-                            trade["id"]
-                        ),
-
-                        "Operação":
-                            (
-                                "🟢 COMPRA"
-                                if side == "COMPRA"
-                                else "🔴 VENDA"
-                            ),
-
-                        "Data/Hora Entrada":
-                            trade["entry_time"],
-
-                        "Preço de Entrada":
-                            f"${entrada:,.2f}",
-
-                        "Preço Atual":
-                            f"${preco_atual:,.2f}",
-
-                        "Stop":
-                            f"${stop:,.2f}",
-
-                        "Preço Alvo":
-                            f"${alvo:,.2f}",
-
-                        "Tempo":
-                            f"{minutos} min",
-
-                        "P&L":
-                            f"{pnl:.2f}%",
-
-                        "Score":
-                            int(
-                                trade["score"]
-                            ),
-
-                        "Regime":
-                            trade["regime"]
-                    }
-                )
-
-            st.dataframe(
-                pd.DataFrame(tabela),
-                use_container_width=True,
-                hide_index=True
-            )
-
+        if abertas.empty:
+            st.info("Nenhuma operação aberta.")
         else:
-
-            st.write(
-                "Nenhuma operação aberta."
-            )
-
-        # ====================================================
-        # PLANO DO NOVO SINAL
-        # ====================================================
-
-        if sinal in [
-            "COMPRA",
-            "VENDA"
-        ]:
-
-            atr = float(
-                row["ATR"]
-            )
-
-            if (
-                np.isfinite(atr)
-                and atr > 0
-            ):
-
-                stop, alvo = (
-                    calcular_plano(
-                        sinal,
-                        preco_atual,
-                        atr
-                    )
-                )
-
-                risco = abs(
-                    preco_atual - stop
-                )
-
-                recompensa = abs(
-                    alvo - preco_atual
-                )
-
-                rr = (
-                    recompensa / risco
-                    if risco > 0
-                    else 0
-                )
-
-                st.subheader(
-                    "📋 PLANO DO SINAL"
-                )
-
-                p1, p2, p3, p4 = st.columns(4)
-
-                with p1:
-
-                    st.metric(
-                        "Preço de Entrada",
-                        f"${preco_atual:,.2f}"
-                    )
-
-                with p2:
-
-                    st.metric(
-                        "Stop",
-                        f"${stop:,.2f}"
-                    )
-
-                with p3:
-
-                    st.metric(
-                        "Preço Alvo",
-                        f"${alvo:,.2f}"
-                    )
-
-                with p4:
-
-                    st.metric(
-                        "Risco / Retorno",
-                        f"1 : {rr:.2f}"
-                    )
-
-        # ====================================================
-        # FATORES
-        # ====================================================
-
-        st.subheader(
-            "🧠 POR QUE O ROBÔ DECIDIU?"
-        )
-
-        f1, f2 = st.columns(2)
-
-        with f1:
-
-            st.markdown(
-                "### 🟢 COMPRA"
-            )
-
-            if fatores_compra:
-
-                tabela_compra = pd.DataFrame(
-                    fatores_compra,
-                    columns=[
-                        "Indicador",
-                        "Pontos"
-                    ]
-                )
-
-                st.dataframe(
-                    tabela_compra,
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-            else:
-
-                st.write(
-                    "Nenhum fator comprador."
-                )
-
-        with f2:
-
-            st.markdown(
-                "### 🔴 VENDA"
-            )
-
-            if fatores_venda:
-
-                tabela_venda = pd.DataFrame(
-                    fatores_venda,
-                    columns=[
-                        "Indicador",
-                        "Pontos"
-                    ]
-                )
-
-                st.dataframe(
-                    tabela_venda,
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-            else:
-
-                st.write(
-                    "Nenhum fator vendedor."
-                )
-
-        # ====================================================
-        # INDICADORES
-        # ====================================================
-
-        st.subheader(
-            "📊 INDICADORES"
-        )
-
-        i1, i2, i3, i4, i5 = st.columns(5)
-
-        with i1:
-
-            st.metric(
-                "RSI",
-                f"{row['RSI']:.2f}"
-            )
-
-        with i2:
-
-            st.metric(
-                "ATR",
-                f"${row['ATR']:,.2f}"
-            )
-
-        with i3:
-
-            st.metric(
-                "EMA20",
-                f"${row['EMA20']:,.2f}"
-            )
-
-        with i4:
-
-            st.metric(
-                "EMA50",
-                f"${row['EMA50']:,.2f}"
-            )
-
-        with i5:
-
-            st.metric(
-                "EMA200",
-                f"${row['EMA200']:,.2f}"
-            )
-
-        # ====================================================
-        # ORDER BOOK
-        # ====================================================
-
-        st.subheader(
-            "📚 ORDER BOOK"
-        )
-
-        o1, o2, o3 = st.columns(3)
-
-        with o1:
-
-            st.metric(
-                "Compradores",
-                f"{orderbook['bids']:,.2f}"
-            )
-
-        with o2:
-
-            st.metric(
-                "Vendedores",
-                f"{orderbook['asks']:,.2f}"
-            )
-
-        with o3:
-
-            st.metric(
-                "Desequilíbrio",
-                f"{orderbook['imbalance']:.3f}"
-            )
-
-        # ====================================================
-        # GRÁFICO
-        # ====================================================
-
-        st.subheader(
-            "📈 GRÁFICO BTC"
-        )
-
-        chart_df = df.tail(150)
-
-        fig = go.Figure()
-
-        fig.add_trace(
-            go.Candlestick(
-                x=chart_df["close_time"],
-                open=chart_df["open"],
-                high=chart_df["high"],
-                low=chart_df["low"],
-                close=chart_df["close"],
-                name="BTC"
-            )
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=chart_df["close_time"],
-                y=chart_df["EMA20"],
-                name="EMA20"
-            )
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=chart_df["close_time"],
-                y=chart_df["EMA50"],
-                name="EMA50"
-            )
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=chart_df["close_time"],
-                y=chart_df["EMA200"],
-                name="EMA200"
-            )
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=chart_df["close_time"],
-                y=chart_df["VWAP"],
-                name="VWAP"
-            )
-        )
-
-        fig.update_layout(
-            template="plotly_dark",
-            height=600,
-            xaxis_rangeslider_visible=False,
-            paper_bgcolor="#080808",
-            plot_bgcolor="#080808"
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-        # ====================================================
-        # PERFORMANCE
-        # ====================================================
-
-        st.subheader(
-            "📊 PERFORMANCE"
-        )
-
-        perf = buscar_performance()
-
-        a, b, c, d, e, f = st.columns(6)
-
-        with a:
-
-            st.metric(
-                "Operações",
-                perf["total"]
-            )
-
-        with b:
-
-            st.metric(
-                "Ganhos",
-                perf["ganhos"]
-            )
-
-        with c:
-
-            st.metric(
-                "Perdas",
-                perf["perdas"]
-            )
-
-        with d:
-
-            st.metric(
-                "Tempo Esgotado",
-                perf["tempo"]
-            )
-
-        with e:
-
-            st.metric(
-                "Win Rate",
-                f"{perf['wr']:.2f}%"
-            )
-
-        with f:
-
-            st.metric(
-                "P&L",
-                f"{perf['pnl']:.2f}%"
-            )
-
-        # ====================================================
-        # HISTÓRICO
-        # ====================================================
-
-        st.subheader(
-            "📚 HISTÓRICO DE OPERAÇÕES"
-        )
-
-        conn = conectar()
-
-        historico = pd.read_sql_query(
-            """
-            SELECT
-                id,
-                side,
-                entry_time,
-                entry_price,
-                stop_price,
-                target_price,
-                exit_time,
-                exit_price,
-                pnl_pct,
-                result,
-                score,
-                regime
-            FROM trades
-            ORDER BY id DESC
-            LIMIT 200
-            """,
-            conn
-        )
-
-        conn.close()
-
-        if not historico.empty:
-
-            historico["Operação"] = (
-                historico["side"]
-                .map(
-                    {
-                        "COMPRA": "🟢 COMPRA",
-                        "VENDA": "🔴 VENDA"
-                    }
-                )
-            )
-
-            historico["Data/Hora Entrada"] = (
-                historico["entry_time"]
-            )
-
-            historico["Preço de Entrada"] = (
-                historico["entry_price"]
-                .apply(
-                    lambda x:
-                    f"${x:,.2f}"
-                )
-            )
-
-            historico["Stop"] = (
-                historico["stop_price"]
-                .apply(
-                    lambda x:
-                    f"${x:,.2f}"
-                )
-            )
-
-            historico["Preço Alvo"] = (
-                historico["target_price"]
-                .apply(
-                    lambda x:
-                    f"${x:,.2f}"
-                )
-            )
-
-            historico["Data/Hora Saída"] = (
-                historico["exit_time"]
-                .fillna("EM ABERTO")
-            )
-
-            historico["Preço de Saída"] = (
-                historico["exit_price"]
-                .apply(
-                    lambda x:
-                    "—"
-                    if pd.isna(x)
-                    else f"${x:,.2f}"
-                )
-            )
-
-            historico["Resultado"] = (
-                historico["result"]
-                .fillna("ABERTA")
-            )
-
-            historico["P&L"] = (
-                historico["pnl_pct"]
-                .apply(
-                    lambda x:
-                    "—"
-                    if pd.isna(x)
-                    else f"{x:.2f}%"
-                )
-            )
-
-            historico["Score"] = (
-                historico["score"]
-            )
-
-            historico["Regime"] = (
-                historico["regime"]
-            )
-
-            historico_final = historico[
-                [
-                    "id",
-                    "Operação",
-                    "Data/Hora Entrada",
-                    "Preço de Entrada",
-                    "Stop",
-                    "Preço Alvo",
-                    "Data/Hora Saída",
-                    "Preço de Saída",
-                    "Resultado",
-                    "P&L",
-                    "Score",
-                    "Regime"
-                ]
-            ].rename(
+            exibicao = abertas.copy()
+            exibicao["entry_price"] = exibicao["entry_price"].map(lambda x: f"${x:,.2f}")
+            exibicao["stop_price"] = exibicao["stop_price"].map(lambda x: f"${x:,.2f}")
+            exibicao["target_price"] = exibicao["target_price"].map(lambda x: f"${x:,.2f}")
+
+            def pnl_atual(row_trade):
+                if row_trade["side"] == "COMPRA":
+                    return ((preco_atual / float(row_trade["entry_price"].replace('$', '').replace(',', ''))) - 1) * 100
+                return ((float(row_trade["entry_price"].replace('$', '').replace(',', '')) / preco_atual) - 1) * 100
+
+            # Mantém P&L atual separado para não alterar a coluna original do banco.
+            exibicao["P&L atual %"] = [
+                pnl_atual(exibicao.iloc[i]) for i in range(len(exibicao))
+            ]
+            exibicao["P&L atual %"] = exibicao["P&L atual %"].map(lambda x: f"{x:+.2f}%")
+
+            exibicao = exibicao.rename(
                 columns={
-                    "id": "ID"
+                    "id": "#",
+                    "side": "Lado",
+                    "entry_time": "Entrada",
+                    "entry_price": "Preço entrada",
+                    "stop_price": "Stop",
+                    "target_price": "Alvo",
+                    "score": "Score",
+                    "regime": "Regime",
                 }
             )
+            colunas = [
+                "#", "Lado", "Entrada", "Preço entrada", "Stop", "Alvo",
+                "P&L atual %", "Score", "Regime",
+            ]
+            st.dataframe(exibicao[colunas], use_container_width=True, hide_index=True)
 
-            st.dataframe(
-                historico_final,
-                use_container_width=True,
-                hide_index=True
+        # --------------------------------------------------------
+        # Auditoria da última leitura
+        # --------------------------------------------------------
+        with st.expander("🔎 Snapshot do sinal atual / auditoria"):
+            audit = pd.DataFrame(
+                {
+                    "Indicador": [
+                        "EMA20", "EMA50", "EMA200", "RSI", "ATR",
+                        "ret_1", "ret_3", "ret_12", "ret_48", "volatility",
+                        "vol_z", "volume_ratio", "volume_z", "VWAP",
+                        "cvd_delta", "orderbook_imbalance", "score_compra",
+                        "score_venda", "regime", "signal", "signal_time",
+                    ],
+                    "Valor": [
+                        row["EMA20"], row["EMA50"], row["EMA200"], row["RSI"], row["ATR"],
+                        row["ret_1"], row["ret_3"], row["ret_12"], row["ret_48"], row["volatility"],
+                        row["vol_z"], row["volume_ratio"], row["volume_z"], row["VWAP"],
+                        row["cvd_delta"], orderbook["imbalance"], score_compra,
+                        score_venda, regime, sinal, str(signal_time),
+                    ],
+                }
             )
+            st.dataframe(audit, use_container_width=True, hide_index=True)
+            if sinal in ["COMPRA", "VENDA"]:
+                st.markdown("**Motivo que será salvo se houver entrada:**")
+                st.code(motivo_entrada, language="text")
 
-        # ====================================================
-        # RODAPÉ
-        # ====================================================
+        # --------------------------------------------------------
+        # Histórico
+        # --------------------------------------------------------
+        st.subheader("Histórico")
+        historico = buscar_historico(100)
+        if historico.empty:
+            st.info("Ainda não existem operações no novo banco.")
+        else:
+            hist = historico.copy()
+            hist = hist.rename(
+                columns={
+                    "id": "#",
+                    "side": "Lado",
+                    "entry_time": "Entrada",
+                    "entry_price": "Preço entrada",
+                    "stop_price": "Stop",
+                    "target_price": "Alvo",
+                    "exit_time": "Saída",
+                    "exit_price": "Preço saída",
+                    "pnl_pct": "P&L %",
+                    "result": "Resultado",
+                    "score": "Score",
+                    "regime": "Regime",
+                    "signal": "Sinal",
+                }
+            )
+            if "P&L %" in hist:
+                hist["P&L %"] = hist["P&L %"].map(
+                    lambda x: "-" if pd.isna(x) else f"{x:+.2f}%"
+                )
+            for col in ["Preço entrada", "Stop", "Alvo", "Preço saída"]:
+                if col in hist.columns:
+                    hist[col] = hist[col].map(
+                        lambda x: "-" if pd.isna(x) else f"${float(x):,.2f}"
+                    )
 
-        st.caption(
-            f"🤖 Monitoramento automático ativo | "
-            f"Atualização a cada {AUTO_REFRESH_SECONDS}s | "
-            f"Máximo: {max_operacoes} operações | "
-            f"Tempo máximo: {tempo_maximo} minutos | "
-            f"Último candle analisado: {signal_time}"
+            hist_cols = [
+                "#", "Lado", "Entrada", "Preço entrada", "Stop", "Alvo",
+                "Saída", "Preço saída", "P&L %", "Resultado", "Score", "Regime", "Sinal",
+            ]
+            st.dataframe(hist[hist_cols], use_container_width=True, hide_index=True)
+
+            ultimo = historico.iloc[0]
+            with st.expander("📋 Motivo da última operação registrada"):
+                st.write(f"**Operação #{int(ultimo['id'])} — {ultimo['side']}**")
+                st.code(str(ultimo["entry_reason"]), language="text")
+
+        # --------------------------------------------------------
+        # Estatísticas
+        # --------------------------------------------------------
+        conn = get_conn()
+        stats = pd.read_sql_query(
+            "SELECT COUNT(*) AS total, SUM(CASE WHEN result = 'GANHO' THEN 1 ELSE 0 END) AS ganhos, COALESCE(SUM(pnl_pct), 0) AS pnl_total FROM trades WHERE result IS NOT NULL",
+            conn,
         )
+        conn.close()
 
-    except Exception as e:
+        total = int(stats.iloc[0]["total"] or 0)
+        ganhos = int(stats.iloc[0]["ganhos"] or 0)
+        pnl_total = float(stats.iloc[0]["pnl_total"] or 0)
+        wr = (ganhos / total * 100) if total else 0
 
-        st.error(
-            f"Erro no monitoramento: {e}"
-        )
+        st.divider()
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Operações fechadas", total)
+        s2.metric("Ganhas", ganhos)
+        s3.metric("WR", f"{wr:.2f}%")
+        s4.metric("P&L acumulado", f"{pnl_total:+.2f}%")
 
+    except requests.RequestException as exc:
+        st.error(f"Erro ao consultar Binance: {exc}")
+    except Exception as exc:
+        st.error(f"Erro no monitoramento: {exc}")
 
-# ============================================================
-# EXECUTAR
-# ============================================================
 
 monitor()
