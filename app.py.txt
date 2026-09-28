@@ -1,0 +1,1674 @@
+import sqlite3
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+import plotly.graph_objects as go
+
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+BINANCE_API = "https://data-api.binance.vision"
+SYMBOL = "BTCUSDT"
+DATABASE = "btc_trader.db"
+
+
+st.set_page_config(
+    page_title="BTC Quant Trader",
+    page_icon="₿",
+    layout="wide"
+)
+
+
+# ============================================================
+# BANCO DE DADOS
+# ============================================================
+
+def conectar():
+    return sqlite3.connect(DATABASE)
+
+
+def criar_banco():
+
+    conn = conectar()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            symbol TEXT,
+
+            side TEXT,
+
+            entry_time TEXT,
+
+            entry_price REAL,
+
+            stop_price REAL,
+
+            target_price REAL,
+
+            exit_time TEXT,
+
+            exit_price REAL,
+
+            pnl_pct REAL,
+
+            result TEXT,
+
+            score REAL,
+
+            regime TEXT,
+
+            notes TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+criar_banco()
+
+
+# ============================================================
+# API BINANCE
+# ============================================================
+
+@st.cache_data(ttl=20)
+def buscar_candles(
+    symbol="BTCUSDT",
+    interval="5m",
+    limit=500
+):
+
+    url = f"{BINANCE_API}/api/v3/klines"
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+
+    resposta = requests.get(
+        url,
+        params=params,
+        timeout=10
+    )
+
+    resposta.raise_for_status()
+
+    dados = resposta.json()
+
+    colunas = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "ignore"
+    ]
+
+    df = pd.DataFrame(
+        dados,
+        columns=colunas
+    )
+
+    colunas_numericas = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote"
+    ]
+
+    for coluna in colunas_numericas:
+
+        df[coluna] = pd.to_numeric(
+            df[coluna],
+            errors="coerce"
+        )
+
+    df["time"] = pd.to_datetime(
+        df["open_time"],
+        unit="ms",
+        utc=True
+    )
+
+    df.set_index(
+        "time",
+        inplace=True
+    )
+
+    return df
+
+
+@st.cache_data(ttl=5)
+def buscar_preco():
+
+    url = f"{BINANCE_API}/api/v3/ticker/price"
+
+    resposta = requests.get(
+        url,
+        params={
+            "symbol": SYMBOL
+        },
+        timeout=10
+    )
+
+    resposta.raise_for_status()
+
+    return float(
+        resposta.json()["price"]
+    )
+
+
+@st.cache_data(ttl=5)
+def buscar_orderbook():
+
+    url = f"{BINANCE_API}/api/v3/depth"
+
+    resposta = requests.get(
+        url,
+        params={
+            "symbol": SYMBOL,
+            "limit": 20
+        },
+        timeout=10
+    )
+
+    resposta.raise_for_status()
+
+    return resposta.json()
+
+
+# ============================================================
+# INDICADORES
+# ============================================================
+
+def calcular_indicadores(df):
+
+    df = df.copy()
+
+    # --------------------------------------------------------
+    # RETORNOS
+    # --------------------------------------------------------
+
+    df["ret_1"] = df["close"].pct_change(1)
+
+    df["ret_3"] = df["close"].pct_change(3)
+
+    df["ret_12"] = df["close"].pct_change(12)
+
+    df["ret_48"] = df["close"].pct_change(48)
+
+
+    # --------------------------------------------------------
+    # MÉDIAS
+    # --------------------------------------------------------
+
+    df["ema20"] = (
+        df["close"]
+        .ewm(span=20, adjust=False)
+        .mean()
+    )
+
+    df["ema50"] = (
+        df["close"]
+        .ewm(span=50, adjust=False)
+        .mean()
+    )
+
+    df["ema200"] = (
+        df["close"]
+        .ewm(span=200, adjust=False)
+        .mean()
+    )
+
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    delta = df["close"].diff()
+
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
+
+    avg_gain = (
+        gain
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+    )
+
+    avg_loss = (
+        loss
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+    )
+
+    rs = (
+        avg_gain /
+        avg_loss.replace(0, np.nan)
+    )
+
+    df["rsi"] = (
+        100 -
+        (
+            100 /
+            (1 + rs)
+        )
+    )
+
+    df["rsi"] = df["rsi"].fillna(50)
+
+
+    # --------------------------------------------------------
+    # ATR
+    # --------------------------------------------------------
+
+    fechamento_anterior = df["close"].shift(1)
+
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+
+            (
+                df["high"] -
+                fechamento_anterior
+            ).abs(),
+
+            (
+                df["low"] -
+                fechamento_anterior
+            ).abs()
+        ],
+        axis=1
+    ).max(axis=1)
+
+    df["atr"] = (
+        tr
+        .rolling(14)
+        .mean()
+    )
+
+
+    # --------------------------------------------------------
+    # VOLATILIDADE
+    # --------------------------------------------------------
+
+    df["volatilidade"] = (
+        df["ret_1"]
+        .rolling(24)
+        .std()
+    )
+
+    media_vol = (
+        df["volatilidade"]
+        .rolling(100)
+        .mean()
+    )
+
+    desvio_vol = (
+        df["volatilidade"]
+        .rolling(100)
+        .std()
+    )
+
+    df["vol_z"] = (
+        (
+            df["volatilidade"] -
+            media_vol
+        )
+        /
+        desvio_vol.replace(0, np.nan)
+    )
+
+
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    media_volume = (
+        df["volume"]
+        .rolling(20)
+        .mean()
+    )
+
+    desvio_volume = (
+        df["volume"]
+        .rolling(50)
+        .std()
+    )
+
+    df["volume_ratio"] = (
+        df["volume"] /
+        media_volume.replace(0, np.nan)
+    )
+
+    df["volume_z"] = (
+        (
+            df["volume"] -
+            df["volume"].rolling(50).mean()
+        )
+        /
+        desvio_volume.replace(0, np.nan)
+    )
+
+
+    # --------------------------------------------------------
+    # VWAP
+    # --------------------------------------------------------
+
+    preco_tipico = (
+        df["high"] +
+        df["low"] +
+        df["close"]
+    ) / 3
+
+    df["vwap"] = (
+        (
+            preco_tipico *
+            df["volume"]
+        )
+        .rolling(50)
+        .sum()
+        /
+        df["volume"]
+        .rolling(50)
+        .sum()
+    )
+
+
+    # --------------------------------------------------------
+    # CVD APROXIMADO
+    # --------------------------------------------------------
+
+    volume_assinado = np.where(
+
+        df["close"] > df["open"],
+
+        df["volume"],
+
+        np.where(
+            df["close"] < df["open"],
+            -df["volume"],
+            0
+        )
+    )
+
+    df["cvd"] = pd.Series(
+        volume_assinado,
+        index=df.index
+    ).cumsum()
+
+    df["cvd_delta"] = (
+        df["cvd"]
+        .diff(12)
+    )
+
+
+    return df
+
+
+# ============================================================
+# ORDER BOOK
+# ============================================================
+
+def calcular_imbalance(orderbook):
+
+    bids = sum(
+        float(qtd)
+        for preco, qtd
+        in orderbook["bids"]
+    )
+
+    asks = sum(
+        float(qtd)
+        for preco, qtd
+        in orderbook["asks"]
+    )
+
+    total = bids + asks
+
+    if total == 0:
+        return 0
+
+    return (
+        (bids - asks) /
+        total
+    )
+
+
+# ============================================================
+# SCORE QUANTITATIVO
+# ============================================================
+
+def gerar_score(row, imbalance):
+
+    long_score = 0
+    short_score = 0
+
+
+    # --------------------------------------------------------
+    # TENDÊNCIA
+    # --------------------------------------------------------
+
+    if row["ema20"] > row["ema50"]:
+
+        long_score += 15
+
+    else:
+
+        short_score += 15
+
+
+    if row["close"] > row["ema200"]:
+
+        long_score += 10
+
+    else:
+
+        short_score += 10
+
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    if row["ret_12"] > 0:
+
+        long_score += 10
+
+    else:
+
+        short_score += 10
+
+
+    if row["ret_48"] > 0:
+
+        long_score += 10
+
+    else:
+
+        short_score += 10
+
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    if 50 <= row["rsi"] <= 70:
+
+        long_score += 10
+
+    elif 30 <= row["rsi"] < 50:
+
+        short_score += 5
+
+
+    if 30 <= row["rsi"] <= 45:
+
+        short_score += 10
+
+
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    if row["volume_z"] > 1:
+
+        if row["ret_1"] > 0:
+
+            long_score += 10
+
+        else:
+
+            short_score += 10
+
+
+    # --------------------------------------------------------
+    # VWAP
+    # --------------------------------------------------------
+
+    if row["close"] > row["vwap"]:
+
+        long_score += 10
+
+    else:
+
+        short_score += 10
+
+
+    # --------------------------------------------------------
+    # CVD
+    # --------------------------------------------------------
+
+    if row["cvd_delta"] > 0:
+
+        long_score += 10
+
+    elif row["cvd_delta"] < 0:
+
+        short_score += 10
+
+
+    # --------------------------------------------------------
+    # ORDER BOOK
+    # --------------------------------------------------------
+
+    if imbalance > 0.10:
+
+        long_score += 10
+
+    elif imbalance < -0.10:
+
+        short_score += 10
+
+
+    # --------------------------------------------------------
+    # REGIME
+    # --------------------------------------------------------
+
+    if row["vol_z"] > 1.5:
+
+        regime = "EXPANSÃO"
+
+    elif row["vol_z"] < -0.8:
+
+        regime = "BAIXA VOLATILIDADE"
+
+    elif (
+        row["ema20"] >
+        row["ema50"]
+        and
+        row["close"] >
+        row["ema200"]
+    ):
+
+        regime = "TENDÊNCIA ALTA"
+
+    elif (
+        row["ema20"] <
+        row["ema50"]
+        and
+        row["close"] <
+        row["ema200"]
+    ):
+
+        regime = "TENDÊNCIA BAIXA"
+
+    else:
+
+        regime = "NEUTRO"
+
+
+    # --------------------------------------------------------
+    # SINAL
+    # --------------------------------------------------------
+
+    if (
+        long_score >= 65
+        and
+        long_score >
+        short_score + 10
+    ):
+
+        sinal = "LONG"
+
+    elif (
+        short_score >= 65
+        and
+        short_score >
+        long_score + 10
+    ):
+
+        sinal = "SHORT"
+
+    else:
+
+        sinal = "NEUTRO"
+
+
+    return (
+        long_score,
+        short_score,
+        sinal,
+        regime
+    )
+
+
+# ============================================================
+# REGISTRAR TRADE
+# ============================================================
+
+def registrar_trade(
+    side,
+    entrada,
+    stop,
+    alvo,
+    score,
+    regime,
+    observacao
+):
+
+    conn = conectar()
+
+    agora = (
+        datetime
+        .now(timezone.utc)
+        .isoformat()
+    )
+
+    conn.execute(
+        """
+        INSERT INTO trades
+        (
+            symbol,
+            side,
+            entry_time,
+            entry_price,
+            stop_price,
+            target_price,
+            score,
+            regime,
+            notes
+        )
+
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+
+        (
+            SYMBOL,
+            side,
+            agora,
+            entrada,
+            stop,
+            alvo,
+            score,
+            regime,
+            observacao
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# FECHAR TRADE
+# ============================================================
+
+def fechar_trade(
+    trade_id,
+    preco_saida
+):
+
+    conn = conectar()
+
+    trade = conn.execute(
+        """
+        SELECT
+            side,
+            entry_price
+
+        FROM trades
+
+        WHERE id = ?
+        AND exit_time IS NULL
+        """,
+
+        (trade_id,)
+    ).fetchone()
+
+
+    if not trade:
+
+        conn.close()
+
+        return
+
+
+    side, entrada = trade
+
+
+    if side == "LONG":
+
+        pnl = (
+            preco_saida /
+            entrada -
+            1
+        ) * 100
+
+    else:
+
+        pnl = (
+            entrada /
+            preco_saida -
+            1
+        ) * 100
+
+
+    if pnl > 0:
+
+        resultado = "GAIN"
+
+    elif pnl < 0:
+
+        resultado = "LOSS"
+
+    else:
+
+        resultado = "ZERO"
+
+
+    agora = (
+        datetime
+        .now(timezone.utc)
+        .isoformat()
+    )
+
+
+    conn.execute(
+        """
+        UPDATE trades
+
+        SET
+            exit_time = ?,
+            exit_price = ?,
+            pnl_pct = ?,
+            result = ?
+
+        WHERE id = ?
+        """,
+
+        (
+            agora,
+            preco_saida,
+            pnl,
+            resultado,
+            trade_id
+        )
+    )
+
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# CONSULTAR TRADES
+# ============================================================
+
+def consultar_trades():
+
+    conn = conectar()
+
+    df = pd.read_sql_query(
+        """
+        SELECT *
+
+        FROM trades
+
+        ORDER BY id DESC
+        """,
+        conn
+    )
+
+    conn.close()
+
+    return df
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.title("⚙️ Configuração")
+
+timeframe = st.sidebar.selectbox(
+    "Timeframe",
+    [
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "4h"
+    ],
+    index=1
+)
+
+
+quantidade = st.sidebar.slider(
+    "Candles",
+    200,
+    1000,
+    500,
+    100
+)
+
+
+atr_stop = st.sidebar.number_input(
+    "Stop ATR",
+    0.1,
+    10.0,
+    1.5,
+    0.1
+)
+
+
+atr_target = st.sidebar.number_input(
+    "Target ATR",
+    0.1,
+    20.0,
+    3.0,
+    0.1
+)
+
+
+if st.sidebar.button(
+    "🔄 Atualizar"
+):
+
+    st.cache_data.clear()
+
+    st.rerun()
+
+
+# ============================================================
+# BUSCAR DADOS
+# ============================================================
+
+try:
+
+    df = buscar_candles(
+        SYMBOL,
+        timeframe,
+        quantidade
+    )
+
+    df = calcular_indicadores(df)
+
+    preco = buscar_preco()
+
+    orderbook = buscar_orderbook()
+
+    imbalance = calcular_imbalance(
+        orderbook
+    )
+
+    ultima = df.iloc[-1]
+
+    (
+        long_score,
+        short_score,
+        sinal,
+        regime
+    ) = gerar_score(
+        ultima,
+        imbalance
+    )
+
+
+except Exception as erro:
+
+    st.error(
+        f"Erro na API: {erro}"
+    )
+
+    st.stop()
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+st.title(
+    "₿ BTC Quant Trader"
+)
+
+st.caption(
+    "Análise quantitativa + paper trading"
+)
+
+
+col1, col2, col3, col4, col5 = st.columns(5)
+
+
+col1.metric(
+    "BTC",
+    f"${preco:,.2f}"
+)
+
+
+col2.metric(
+    "LONG",
+    f"{long_score}/100"
+)
+
+
+col3.metric(
+    "SHORT",
+    f"{short_score}/100"
+)
+
+
+col4.metric(
+    "REGIME",
+    regime
+)
+
+
+col5.metric(
+    "BOOK",
+    f"{imbalance:+.2%}"
+)
+
+
+# ============================================================
+# SINAL
+# ============================================================
+
+st.subheader(
+    "🎯 Sinal"
+)
+
+
+if sinal == "LONG":
+
+    st.success(
+        f"LONG — Score {long_score}/100"
+    )
+
+elif sinal == "SHORT":
+
+    st.error(
+        f"SHORT — Score {short_score}/100"
+    )
+
+else:
+
+    st.info(
+        f"NEUTRO | "
+        f"Long {long_score} | "
+        f"Short {short_score}"
+    )
+
+
+# ============================================================
+# STOP / TARGET
+# ============================================================
+
+atr = float(
+    ultima["atr"]
+)
+
+
+if sinal == "LONG":
+
+    stop = (
+        preco -
+        atr * atr_stop
+    )
+
+    alvo = (
+        preco +
+        atr * atr_target
+    )
+
+    score_operacao = long_score
+
+
+elif sinal == "SHORT":
+
+    stop = (
+        preco +
+        atr * atr_stop
+    )
+
+    alvo = (
+        preco -
+        atr * atr_target
+    )
+
+    score_operacao = short_score
+
+
+else:
+
+    stop = np.nan
+    alvo = np.nan
+
+    score_operacao = max(
+        long_score,
+        short_score
+    )
+
+
+c1, c2, c3, c4 = st.columns(4)
+
+
+c1.metric(
+    "ATR",
+    f"${atr:,.2f}"
+)
+
+
+c2.metric(
+    "Entrada",
+    f"${preco:,.2f}"
+)
+
+
+c3.metric(
+    "Stop",
+    "-" if np.isnan(stop)
+    else f"${stop:,.2f}"
+)
+
+
+c4.metric(
+    "Target",
+    "-" if np.isnan(alvo)
+    else f"${alvo:,.2f}"
+)
+
+
+# ============================================================
+# VARIÁVEIS
+# ============================================================
+
+st.subheader(
+    "📊 Variáveis quantitativas"
+)
+
+
+dados_variaveis = pd.DataFrame({
+
+    "Variável": [
+
+        "EMA 20",
+        "EMA 50",
+        "EMA 200",
+        "RSI",
+        "Retorno 1 candle",
+        "Retorno 1h",
+        "Volatilidade Z",
+        "Volume Ratio",
+        "Volume Z",
+        "VWAP",
+        "CVD Delta",
+        "ATR",
+        "Order Book"
+    ],
+
+    "Valor": [
+
+        ultima["ema20"],
+        ultima["ema50"],
+        ultima["ema200"],
+        ultima["rsi"],
+        ultima["ret_1"],
+        ultima["ret_12"],
+        ultima["vol_z"],
+        ultima["volume_ratio"],
+        ultima["volume_z"],
+        ultima["vwap"],
+        ultima["cvd_delta"],
+        ultima["atr"],
+        imbalance
+    ]
+})
+
+
+st.dataframe(
+    dados_variaveis,
+    use_container_width=True,
+    hide_index=True
+)
+
+
+# ============================================================
+# GRÁFICO
+# ============================================================
+
+st.subheader(
+    "📈 Gráfico BTC"
+)
+
+
+grafico = go.Figure()
+
+
+grafico.add_trace(
+    go.Candlestick(
+
+        x=df.index,
+
+        open=df["open"],
+
+        high=df["high"],
+
+        low=df["low"],
+
+        close=df["close"],
+
+        name="BTC"
+    )
+)
+
+
+grafico.add_trace(
+    go.Scatter(
+
+        x=df.index,
+
+        y=df["ema20"],
+
+        name="EMA 20"
+    )
+)
+
+
+grafico.add_trace(
+    go.Scatter(
+
+        x=df.index,
+
+        y=df["ema50"],
+
+        name="EMA 50"
+    )
+)
+
+
+grafico.add_trace(
+    go.Scatter(
+
+        x=df.index,
+
+        y=df["ema200"],
+
+        name="EMA 200"
+    )
+)
+
+
+grafico.add_trace(
+    go.Scatter(
+
+        x=df.index,
+
+        y=df["vwap"],
+
+        name="VWAP"
+    )
+)
+
+
+grafico.update_layout(
+
+    height=650,
+
+    xaxis_rangeslider_visible=False
+)
+
+
+st.plotly_chart(
+    grafico,
+    use_container_width=True
+)
+
+
+# ============================================================
+# REGISTRAR OPERAÇÃO
+# ============================================================
+
+st.subheader(
+    "📝 Registrar operação"
+)
+
+
+with st.form(
+    "form_trade"
+):
+
+    c1, c2 = st.columns(2)
+
+
+    with c1:
+
+        lado = st.selectbox(
+            "Direção",
+            [
+                "LONG",
+                "SHORT"
+            ]
+        )
+
+
+        entrada = st.number_input(
+            "Entrada",
+            value=float(preco),
+            min_value=0.01
+        )
+
+
+    with c2:
+
+        stop_manual = st.number_input(
+            "Stop",
+            value=float(
+                stop
+                if not np.isnan(stop)
+                else preco - atr * atr_stop
+            ),
+            min_value=0.01
+        )
+
+
+        alvo_manual = st.number_input(
+            "Target",
+            value=float(
+                alvo
+                if not np.isnan(alvo)
+                else preco + atr * atr_target
+            ),
+            min_value=0.01
+        )
+
+
+    observacao = st.text_input(
+        "Observação",
+        value=(
+            f"Sinal={sinal}; "
+            f"Regime={regime}"
+        )
+    )
+
+
+    registrar = st.form_submit_button(
+        "➕ Registrar"
+    )
+
+
+    if registrar:
+
+        score = (
+            long_score
+            if lado == "LONG"
+            else short_score
+        )
+
+
+        registrar_trade(
+
+            lado,
+
+            entrada,
+
+            stop_manual,
+
+            alvo_manual,
+
+            score,
+
+            regime,
+
+            observacao
+        )
+
+
+        st.success(
+            "Operação registrada."
+        )
+
+
+        st.rerun()
+
+
+# ============================================================
+# OPERAÇÕES ABERTAS
+# ============================================================
+
+trades = consultar_trades()
+
+
+st.subheader(
+    "📌 Operações abertas"
+)
+
+
+abertas = trades[
+    trades["exit_time"].isna()
+]
+
+
+if len(abertas) == 0:
+
+    st.info(
+        "Nenhuma operação aberta."
+    )
+
+
+else:
+
+    for _, trade in abertas.iterrows():
+
+        with st.container(
+            border=True
+        ):
+
+            st.write(
+                f"### #{int(trade['id'])} "
+                f"{trade['side']}"
+            )
+
+
+            st.write(
+                f"Entrada: "
+                f"${trade['entry_price']:,.2f}"
+            )
+
+
+            st.write(
+                f"Stop: "
+                f"${trade['stop_price']:,.2f}"
+            )
+
+
+            st.write(
+                f"Target: "
+                f"${trade['target_price']:,.2f}"
+            )
+
+
+            saida = st.number_input(
+
+                "Preço de saída",
+
+                value=float(preco),
+
+                min_value=0.01,
+
+                key=f"saida_{trade['id']}"
+            )
+
+
+            if st.button(
+                "Fechar operação",
+                key=f"fechar_{trade['id']}"
+            ):
+
+                fechar_trade(
+
+                    int(trade["id"]),
+
+                    saida
+                )
+
+
+                st.success(
+                    "Operação encerrada."
+                )
+
+
+                st.rerun()
+
+
+# ============================================================
+# PERFORMANCE
+# ============================================================
+
+st.subheader(
+    "💰 Performance"
+)
+
+
+fechadas = trades[
+    trades["exit_time"].notna()
+].copy()
+
+
+if len(fechadas) == 0:
+
+    st.info(
+        "Nenhuma operação encerrada."
+    )
+
+
+else:
+
+    total = len(fechadas)
+
+
+    gains = fechadas[
+        fechadas["pnl_pct"] > 0
+    ]
+
+
+    losses = fechadas[
+        fechadas["pnl_pct"] < 0
+    ]
+
+
+    wr = (
+        len(gains) /
+        total *
+        100
+    )
+
+
+    avg_gain = (
+
+        gains["pnl_pct"].mean()
+
+        if len(gains)
+
+        else 0
+    )
+
+
+    avg_loss = (
+
+        losses["pnl_pct"].mean()
+
+        if len(losses)
+
+        else 0
+    )
+
+
+    expectancy = (
+
+        (wr / 100) *
+        avg_gain
+
+        +
+
+        ((100 - wr) / 100) *
+        avg_loss
+    )
+
+
+    if len(losses) > 0:
+
+        profit_factor = (
+
+            gains["pnl_pct"].sum()
+            /
+            abs(
+                losses["pnl_pct"].sum()
+            )
+        )
+
+    else:
+
+        profit_factor = np.nan
+
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+
+    c1.metric(
+        "Trades",
+        total
+    )
+
+
+    c2.metric(
+        "Win Rate",
+        f"{wr:.2f}%"
+    )
+
+
+    c3.metric(
+        "Gain Médio",
+        f"{avg_gain:.2f}%"
+    )
+
+
+    c4.metric(
+        "Loss Médio",
+        f"{avg_loss:.2f}%"
+    )
+
+
+    c5.metric(
+        "Expectancy",
+        f"{expectancy:.3f}%"
+    )
+
+
+    st.metric(
+
+        "Profit Factor",
+
+        "—"
+
+        if np.isnan(
+            profit_factor
+        )
+
+        else f"{profit_factor:.2f}"
+    )
+
+
+    # --------------------------------------------------------
+    # CURVA DE EQUITY
+    # --------------------------------------------------------
+
+    fechadas = fechadas.sort_values(
+        "id"
+    )
+
+
+    fechadas["equity"] = (
+        fechadas["pnl_pct"]
+        .cumsum()
+    )
+
+
+    curva = go.Figure()
+
+
+    curva.add_trace(
+        go.Scatter(
+
+            x=list(
+                range(
+                    1,
+                    len(fechadas) + 1
+                )
+            ),
+
+            y=fechadas["equity"],
+
+            mode="lines+markers",
+
+            name="Equity"
+        )
+    )
+
+
+    curva.update_layout(
+
+        title="Curva de P&L acumulado",
+
+        xaxis_title="Operações",
+
+        yaxis_title="P&L (%)",
+
+        height=400
+    )
+
+
+    st.plotly_chart(
+        curva,
+        use_container_width=True
+    )
+
+
+# ============================================================
+# HISTÓRICO
+# ============================================================
+
+st.subheader(
+    "🗂️ Histórico"
+)
+
+
+if len(trades):
+
+    st.dataframe(
+
+        trades,
+
+        use_container_width=True,
+
+        hide_index=True
+    )
+
+else:
+
+    st.info(
+        "Nenhuma operação registrada."
+    )
+
+
+# ============================================================
+# AVISO
+# ============================================================
+
+st.caption(
+    "Este sistema é de análise e paper trading. "
+    "Não envia ordens reais. "
+    "A API utilizada é a API pública de dados da Binance."
+)
