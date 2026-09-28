@@ -1,5 +1,6 @@
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import uuid
 
 import numpy as np
 import pandas as pd
@@ -10,6 +11,7 @@ import streamlit as st
 # CONFIGURAÇÃO
 # ============================================================
 BINANCE_API = "https://data-api.binance.vision"
+DERIBIT_API = "https://www.deribit.com/api/v2"
 SYMBOL = "BTCUSDT"
 INTERVAL = "5m"
 DATABASE = "btc_trader_v2.db"
@@ -17,6 +19,22 @@ AUTO_REFRESH_SECONDS = 10
 KLINE_LIMIT = 500
 ATR_STOP_MULTIPLIER = 1.0
 ATR_TARGET_MULTIPLIER = 2.0
+
+# Estratégia D: proxy de GEX baseado no open interest e gamma publicados
+# pela Deribit. O sinal de GEX é uma PROXY, porque o posicionamento do dealer
+# não é observável diretamente pelo open interest público.
+D_MAX_DTE_HOURS = 24.0
+D_ATM_BAND_PCT = 0.01
+D_ATM_ELEVATED_PERCENTILE = 75.0
+D_GEX_NEGATIVE_THRESHOLD = 0.0
+
+# Estratégia E: ratio Brent / WTI (Crude)
+BRENT_YAHOO = "BZ=F"
+WTI_YAHOO = "CL=F"
+E_RATIO_WINDOW = 100
+E_RATIO_Z_THRESHOLD = 2.0
+E_RATIO_INTERVAL = "5m"
+E_RATIO_RANGE = "5d"
 
 # ============================================================
 # PÁGINA / ESTILO
@@ -41,7 +59,6 @@ st.markdown(
 
 # ============================================================
 # BANCO DE DADOS
-# Novo banco: btc_trader_v2.db
 # ============================================================
 def get_conn():
     conn = sqlite3.connect(DATABASE, timeout=30)
@@ -70,8 +87,6 @@ def criar_banco():
             regime TEXT,
             notes TEXT,
             signal_time TEXT,
-
-            -- Snapshot completo dos indicadores no momento da entrada
             ema20 REAL,
             ema50 REAL,
             ema200 REAL,
@@ -91,14 +106,57 @@ def criar_banco():
             score_compra REAL,
             score_venda REAL,
             signal TEXT,
-            entry_reason TEXT
+            entry_reason TEXT,
+            strategy TEXT DEFAULT 'A',
+            cycle_id TEXT,
+            gex_proxy REAL,
+            gex_calls REAL,
+            gex_puts REAL,
+            atm_oi REAL,
+            atm_oi_total REAL,
+            atm_oi_ratio REAL,
+            nearest_expiry TEXT,
+            dte_hours REAL,
+            gex_condition TEXT,
+            brent_price REAL,
+            wti_price REAL,
+            brent_wti_ratio REAL,
+            brent_wti_ratio_mean REAL,
+            brent_wti_ratio_std REAL,
+            brent_wti_z REAL,
+            brent_wti_change REAL,
+            brent_wti_condition TEXT
         )
         """
     )
-    # Compatibilidade caso o banco v2 já tenha sido criado antes desta atualização.
+
     colunas = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
-    if "exit_reason" not in colunas:
-        conn.execute("ALTER TABLE trades ADD COLUMN exit_reason TEXT")
+    novas = {
+        "exit_reason": "TEXT",
+        "entry_reason": "TEXT",
+        "strategy": "TEXT DEFAULT 'A'",
+        "cycle_id": "TEXT",
+        "gex_proxy": "REAL",
+        "gex_calls": "REAL",
+        "gex_puts": "REAL",
+        "atm_oi": "REAL",
+        "atm_oi_total": "REAL",
+        "atm_oi_ratio": "REAL",
+        "nearest_expiry": "TEXT",
+        "dte_hours": "REAL",
+        "gex_condition": "TEXT",
+        "brent_price": "REAL",
+        "wti_price": "REAL",
+        "brent_wti_ratio": "REAL",
+        "brent_wti_ratio_mean": "REAL",
+        "brent_wti_ratio_std": "REAL",
+        "brent_wti_z": "REAL",
+        "brent_wti_change": "REAL",
+        "brent_wti_condition": "TEXT",
+    }
+    for nome, tipo in novas.items():
+        if nome not in colunas:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {nome} {tipo}")
 
     conn.commit()
     conn.close()
@@ -114,22 +172,22 @@ def agora():
 
 
 def fmt_num(value, casas=2):
-    if value is None or not np.isfinite(float(value)):
+    if value is None:
         return "-"
-    return f"{float(value):,.{casas}f}"
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if not np.isfinite(value):
+        return "-"
+    return f"{value:,.{casas}f}"
 
 
 def buscar_operacoes_abertas():
     conn = get_conn()
     df = pd.read_sql_query(
         """
-        SELECT
-            id, symbol, side, entry_time, entry_price, stop_price, target_price,
-            exit_time, exit_price, pnl_pct, result, exit_reason, score, regime, notes,
-            signal_time, ema20, ema50, ema200, rsi, atr, ret_1, ret_3, ret_12,
-            ret_48, volatility, vol_z, volume_ratio, volume_z, vwap, cvd_delta,
-            orderbook_imbalance, score_compra, score_venda, signal, entry_reason
-        FROM trades
+        SELECT * FROM trades
         WHERE exit_time IS NULL
         ORDER BY id DESC
         """,
@@ -139,15 +197,11 @@ def buscar_operacoes_abertas():
     return df
 
 
-def buscar_historico(limite=100):
+def buscar_historico(limite=200):
     conn = get_conn()
     df = pd.read_sql_query(
         """
-        SELECT
-            id, side, entry_time, entry_price, stop_price, target_price,
-            exit_time, exit_price, pnl_pct, result, exit_reason, score, regime,
-            signal_time, signal, entry_reason
-        FROM trades
+        SELECT * FROM trades
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -158,19 +212,23 @@ def buscar_historico(limite=100):
     return df
 
 
-def entrada_ja_registrada(signal_time):
+def entrada_ja_registrada(signal_time, strategy="A", cycle_id=None, side=None):
     conn = get_conn()
-    cur = conn.execute(
-        "SELECT COUNT(*) FROM trades WHERE signal_time = ?",
-        (str(signal_time),),
-    )
+    query = "SELECT COUNT(*) FROM trades WHERE signal_time = ? AND COALESCE(strategy, 'A') = ?"
+    params = [str(signal_time), strategy]
+    if cycle_id is not None:
+        query += " AND cycle_id = ?"
+        params.append(cycle_id)
+    if side is not None:
+        query += " AND side = ?"
+        params.append(side)
+    cur = conn.execute(query, tuple(params))
     existe = cur.fetchone()[0] > 0
     conn.close()
     return existe
 
 
 def validar_plano(side, entrada, stop, target):
-    """Validação de segurança antes de gravar a operação."""
     entrada = float(entrada)
     stop = float(stop)
     target = float(target)
@@ -178,21 +236,12 @@ def validar_plano(side, entrada, stop, target):
     if not all(np.isfinite([entrada, stop, target])):
         return False, "Preço de entrada, stop ou alvo inválido."
 
-    if side == "COMPRA":
-        if not (stop < entrada < target):
-            return False, (
-                f"Plano inválido para COMPRA: esperado STOP < ENTRADA < ALVO, "
-                f"mas recebeu {stop:.2f} < {entrada:.2f} < {target:.2f}."
-            )
-    elif side == "VENDA":
-        if not (target < entrada < stop):
-            return False, (
-                f"Plano inválido para VENDA: esperado ALVO < ENTRADA < STOP, "
-                f"mas recebeu {target:.2f} < {entrada:.2f} < {stop:.2f}."
-            )
-    else:
+    if side == "COMPRA" and not (stop < entrada < target):
+        return False, "Plano inválido para COMPRA: STOP < ENTRADA < ALVO."
+    if side == "VENDA" and not (target < entrada < stop):
+        return False, "Plano inválido para VENDA: ALVO < ENTRADA < STOP."
+    if side not in ("COMPRA", "VENDA"):
         return False, f"Lado inválido: {side}"
-
     return True, "Plano válido."
 
 
@@ -210,30 +259,40 @@ def registrar_trade(
     score_venda,
     signal,
     entry_reason,
+    strategy="A",
+    cycle_id=None,
+    gex_data=None,
+    ratio_data=None,
     notes="",
 ):
-    # 3) Segurança: nunca grava uma operação com stop/alvo invertidos.
     valido, mensagem = validar_plano(side, entry_price, stop_price, target_price)
     if not valido:
         raise ValueError(mensagem)
 
+    gex_data = gex_data or {}
+    ratio_data = ratio_data or {}
     conn = get_conn()
     conn.execute(
         """
         INSERT INTO trades (
             symbol, side, entry_time, entry_price, stop_price, target_price,
-            exit_time, exit_price, pnl_pct, result, score, regime, notes,
-            signal_time,
+            exit_time, exit_price, pnl_pct, result, exit_reason, score, regime,
+            notes, signal_time,
             ema20, ema50, ema200, rsi, atr, ret_1, ret_3, ret_12, ret_48,
             volatility, vol_z, volume_ratio, volume_z, vwap, cvd_delta,
-            orderbook_imbalance, score_compra, score_venda, signal, entry_reason
+            orderbook_imbalance, score_compra, score_venda, signal, entry_reason,
+            strategy, cycle_id, gex_proxy, gex_calls, gex_puts, atm_oi,
+            atm_oi_total, atm_oi_ratio, nearest_expiry, dte_hours, gex_condition,
+            brent_price, wti_price, brent_wti_ratio, brent_wti_ratio_mean,
+            brent_wti_ratio_std, brent_wti_z, brent_wti_change, brent_wti_condition
         ) VALUES (
             ?, ?, ?, ?, ?, ?,
-            NULL, NULL, NULL, NULL, ?, ?, ?,
-            ?,
+            NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         (
@@ -267,6 +326,25 @@ def registrar_trade(
             float(score_venda),
             signal,
             entry_reason,
+            strategy,
+            cycle_id,
+            gex_data.get("gex_proxy"),
+            gex_data.get("gex_calls"),
+            gex_data.get("gex_puts"),
+            gex_data.get("atm_oi"),
+            gex_data.get("atm_oi_total"),
+            gex_data.get("atm_oi_ratio"),
+            gex_data.get("nearest_expiry"),
+            gex_data.get("dte_hours"),
+            gex_data.get("gex_condition"),
+            ratio_data.get("brent_price"),
+            ratio_data.get("wti_price"),
+            ratio_data.get("ratio"),
+            ratio_data.get("ratio_mean"),
+            ratio_data.get("ratio_std"),
+            ratio_data.get("z"),
+            ratio_data.get("change"),
+            ratio_data.get("condition"),
         ),
     )
     conn.commit()
@@ -281,7 +359,6 @@ def fechar_trade(trade_id, exit_price, exit_reason):
         "SELECT side, entry_price FROM trades WHERE id = ?",
         (int(trade_id),),
     ).fetchone()
-
     if row is None:
         conn.close()
         return
@@ -295,13 +372,7 @@ def fechar_trade(trade_id, exit_price, exit_reason):
     else:
         pnl_pct = ((entry_price / exit_price) - 1) * 100
 
-    if pnl_pct > 0:
-        result = "GANHO"
-    elif pnl_pct < 0:
-        result = "PERDA"
-    else:
-        result = "EMPATE"
-
+    result = "GANHO" if pnl_pct > 0 else "PERDA" if pnl_pct < 0 else "EMPATE"
     conn.execute(
         """
         UPDATE trades
@@ -321,13 +392,11 @@ def monitorar_operacoes(preco_atual, tempo_maximo):
 
     fechadas = []
     agora_dt = datetime.now()
-
     for _, trade in abertas.iterrows():
         trade_id = int(trade["id"])
         side = trade["side"]
         entry_time = pd.to_datetime(trade["entry_time"])
         minutos_aberto = (agora_dt - entry_time.to_pydatetime()).total_seconds() / 60
-
         exit_reason = None
 
         if side == "COMPRA":
@@ -346,7 +415,6 @@ def monitorar_operacoes(preco_atual, tempo_maximo):
 
         if exit_reason:
             fechar_trade(trade_id, preco_atual, exit_reason)
-            # O resultado GANHO/PERDA é calculado pelo P&L real no fechamento.
             fechadas.append((trade_id, exit_reason))
 
     return fechadas
@@ -356,23 +424,21 @@ def monitorar_operacoes(preco_atual, tempo_maximo):
 # ============================================================
 @st.cache_data(ttl=4, show_spinner=False)
 def buscar_klines():
-    url = f"{BINANCE_API}/api/v3/klines"
-    params = {"symbol": SYMBOL, "interval": INTERVAL, "limit": KLINE_LIMIT}
-    r = requests.get(url, params=params, timeout=10)
+    r = requests.get(
+        f"{BINANCE_API}/api/v3/klines",
+        params={"symbol": SYMBOL, "interval": INTERVAL, "limit": KLINE_LIMIT},
+        timeout=10,
+    )
     r.raise_for_status()
     data = r.json()
-
     cols = [
         "open_time", "Open", "High", "Low", "Close", "Volume",
         "close_time", "quote_volume", "trades", "taker_buy_base",
         "taker_buy_quote", "ignore",
     ]
     df = pd.DataFrame(data, columns=cols)
-
-    numeric_cols = ["Open", "High", "Low", "Close", "Volume", "quote_volume"]
-    for col in numeric_cols:
+    for col in ["Open", "High", "Low", "Close", "Volume", "quote_volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
     return df
@@ -380,29 +446,288 @@ def buscar_klines():
 
 @st.cache_data(ttl=2, show_spinner=False)
 def buscar_preco():
-    url = f"{BINANCE_API}/api/v3/ticker/price"
-    r = requests.get(url, params={"symbol": SYMBOL}, timeout=10)
+    r = requests.get(
+        f"{BINANCE_API}/api/v3/ticker/price",
+        params={"symbol": SYMBOL},
+        timeout=10,
+    )
     r.raise_for_status()
     return float(r.json()["price"])
 
 
 @st.cache_data(ttl=2, show_spinner=False)
 def buscar_orderbook():
-    url = f"{BINANCE_API}/api/v3/depth"
-    r = requests.get(url, params={"symbol": SYMBOL, "limit": 50}, timeout=10)
+    r = requests.get(
+        f"{BINANCE_API}/api/v3/depth",
+        params={"symbol": SYMBOL, "limit": 50},
+        timeout=10,
+    )
     r.raise_for_status()
     data = r.json()
-
     bids = sum(float(price) * float(qty) for price, qty in data.get("bids", []))
     asks = sum(float(price) * float(qty) for price, qty in data.get("asks", []))
-
     total = bids + asks
     imbalance = (bids - asks) / total if total > 0 else 0.0
+    return {"bids": bids, "asks": asks, "imbalance": imbalance}
+
+# ============================================================
+# BRENT / WTI — Estratégia E
+# ============================================================
+@st.cache_data(ttl=30, show_spinner=False)
+def buscar_serie_yahoo(ticker, range_value=E_RATIO_RANGE, interval=E_RATIO_INTERVAL):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    r = requests.get(
+        url,
+        params={"range": range_value, "interval": interval, "events": "history"},
+        timeout=15,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    r.raise_for_status()
+    data = r.json().get("chart", {}).get("result")
+    if not data:
+        raise RuntimeError(f"Yahoo não retornou dados para {ticker}.")
+    result = data[0]
+    timestamps = result.get("timestamp", [])
+    quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+    closes = quote.get("close", [])
+    frame = pd.DataFrame({"timestamp": pd.to_datetime(timestamps, unit="s", utc=True), "close": closes})
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame.dropna(subset=["close"]).drop_duplicates("timestamp").sort_values("timestamp")
+    if frame.empty:
+        raise RuntimeError(f"Série vazia para {ticker}.")
+    return frame
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def calcular_ratio_brent_wti():
+    brent = buscar_serie_yahoo(BRENT_YAHOO).rename(columns={"close": "brent"})
+    wti = buscar_serie_yahoo(WTI_YAHOO).rename(columns={"close": "wti"})
+    df_ratio = pd.merge(brent, wti, on="timestamp", how="inner")
+    df_ratio = df_ratio[(df_ratio["brent"] > 0) & (df_ratio["wti"] > 0)].copy()
+    df_ratio["ratio"] = df_ratio["brent"] / df_ratio["wti"]
+    df_ratio["ratio_mean"] = df_ratio["ratio"].rolling(E_RATIO_WINDOW).mean()
+    df_ratio["ratio_std"] = df_ratio["ratio"].rolling(E_RATIO_WINDOW).std()
+    df_ratio["z"] = (df_ratio["ratio"] - df_ratio["ratio_mean"]) / df_ratio["ratio_std"].replace(0, np.nan)
+    df_ratio["change"] = df_ratio["ratio"].pct_change()
+    ultimo = df_ratio.iloc[-1]
+    z = float(ultimo["z"]) if pd.notna(ultimo["z"]) else np.nan
+    if np.isfinite(z) and z >= E_RATIO_Z_THRESHOLD:
+        condition = "RATIO ALTO / EXTREMO"
+    elif np.isfinite(z) and z <= -E_RATIO_Z_THRESHOLD:
+        condition = "RATIO BAIXO / EXTREMO"
+    elif np.isfinite(z):
+        condition = "RATIO NORMAL"
+    else:
+        condition = "RATIO INSUFICIENTE"
+    return {
+        "brent_price": float(ultimo["brent"]),
+        "wti_price": float(ultimo["wti"]),
+        "ratio": float(ultimo["ratio"]),
+        "ratio_mean": float(ultimo["ratio_mean"]) if pd.notna(ultimo["ratio_mean"]) else None,
+        "ratio_std": float(ultimo["ratio_std"]) if pd.notna(ultimo["ratio_std"]) else None,
+        "z": z if np.isfinite(z) else None,
+        "change": float(ultimo["change"]) if pd.notna(ultimo["change"]) else None,
+        "condition": condition,
+        "ready": bool(np.isfinite(z)),
+    }
+
+
+def estrategia_e_signal(sinal_tecnico, ratio_data):
+    """
+    Estratégia E usa Brent/WTI como filtro de contexto, não como previsão
+    direcional isolada: só libera o sinal técnico quando o ratio está em
+    extremo (|Z| >= 2). A direção continua vindo do modelo técnico BTC.
+    """
+    if not ratio_data or not ratio_data.get("ready"):
+        return "AGUARDAR", "E sem Z-score suficiente para o ratio Brent/WTI."
+    z = float(ratio_data["z"])
+    if abs(z) < E_RATIO_Z_THRESHOLD:
+        return "AGUARDAR", f"E bloqueada: |Z| {abs(z):.2f} < {E_RATIO_Z_THRESHOLD:.1f}."
+    if sinal_tecnico not in ("COMPRA", "VENDA"):
+        return "AGUARDAR", "E encontrou extremo no ratio, mas o sinal técnico BTC não confirmou direção."
+    return sinal_tecnico, (
+        f"E confirmada | Brent ${ratio_data['brent_price']:.2f} | WTI ${ratio_data['wti_price']:.2f} | "
+        f"Ratio {ratio_data['ratio']:.4f} | Z {z:+.2f} | {ratio_data['condition']} | "
+        f"direção BTC confirmada pelo sinal técnico {sinal_tecnico}."
+    )
+
+
+# ============================================================
+# DERIBIT / GEX
+# ============================================================
+@st.cache_data(ttl=30, show_spinner=False)
+def buscar_opcoes_deribit():
+    """Busca resumo + metadados dos contratos de opção BTC na Deribit."""
+    r_summary = requests.get(
+        f"{DERIBIT_API}/public/get_book_summary_by_currency",
+        params={"currency": "BTC", "kind": "option"},
+        timeout=15,
+    )
+    r_summary.raise_for_status()
+    summary = r_summary.json().get("result", [])
+    if not summary:
+        raise RuntimeError("Deribit não retornou resumo de opções BTC.")
+
+    r_instruments = requests.get(
+        f"{DERIBIT_API}/public/get_instruments",
+        params={"currency": "BTC", "kind": "option", "expired": "false"},
+        timeout=15,
+    )
+    r_instruments.raise_for_status()
+    instruments = r_instruments.json().get("result", [])
+
+    metadata = {item.get("instrument_name"): item for item in instruments}
+    resultado = []
+    for item in summary:
+        nome = item.get("instrument_name")
+        meta = metadata.get(nome, {})
+        combinado = dict(meta)
+        combinado.update(item)
+        resultado.append(combinado)
+    return resultado
+
+
+def calcular_gex_proxy(opcoes, preco_btc):
+    """
+    Calcula uma proxy normalizada de GEX.
+
+    Assunção explícita: calls contribuem positivamente e puts negativamente,
+    ponderadas por OI * gamma. Isso NÃO observa a posição real dos dealers;
+    serve como variável de regime/pesquisa.
+    """
+    agora_utc = datetime.now(timezone.utc)
+    registros = []
+
+    for item in opcoes:
+        nome = item.get("instrument_name", "")
+        if not nome:
+            continue
+
+        # O nome normalmente termina em -C ou -P; usamos também option_type quando disponível.
+        tipo = str(item.get("option_type", "")).lower()
+        if tipo not in ("call", "put"):
+            if nome.endswith("-C"):
+                tipo = "call"
+            elif nome.endswith("-P"):
+                tipo = "put"
+            else:
+                continue
+
+        try:
+            strike = float(item.get("strike"))
+        except (TypeError, ValueError):
+            # Algumas respostas podem não carregar strike diretamente.
+            try:
+                partes = nome.split("-")
+                strike = float(partes[-2])
+            except Exception:
+                continue
+
+        oi = item.get("open_interest")
+        gamma = (item.get("greeks") or {}).get("gamma")
+        if gamma is None:
+            gamma = item.get("gamma")
+
+        try:
+            oi = float(oi)
+            gamma = float(gamma)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(oi) or not np.isfinite(gamma) or oi <= 0 or gamma <= 0:
+            continue
+
+        exp_ms = item.get("expiration_timestamp")
+        if exp_ms is None:
+            # Alguns endpoints podem usar expiration_timestamp no instrumento.
+            continue
+        try:
+            expiry = datetime.fromtimestamp(float(exp_ms) / 1000, tz=timezone.utc)
+        except Exception:
+            continue
+
+        dte_hours = (expiry - agora_utc).total_seconds() / 3600
+        if dte_hours < -1:
+            continue
+
+        # Proxy de exposição: OI * gamma * S^2. Escala 0.01 apenas para leitura.
+        bruto = oi * gamma * (preco_btc ** 2) * 0.01
+        assinado = bruto if tipo == "call" else -bruto
+        registros.append(
+            {
+                "instrument_name": nome,
+                "type": tipo,
+                "strike": strike,
+                "oi": oi,
+                "gamma": gamma,
+                "expiry": expiry,
+                "dte_hours": dte_hours,
+                "gex": assinado,
+            }
+        )
+
+    if not registros:
+        raise RuntimeError("Não foi possível obter gamma/OI utilizáveis da Deribit.")
+
+    df = pd.DataFrame(registros)
+    expiries = sorted(df["expiry"].unique())
+    nearest_expiry = expiries[0]
+    nearest = df[df["expiry"] == nearest_expiry].copy()
+
+    gex_calls = float(df.loc[df["type"] == "call", "gex"].sum())
+    gex_puts = float(df.loc[df["type"] == "put", "gex"].sum())
+    gex_proxy = float(df["gex"].sum())
+
+    # ATM OI na expiração mais próxima: strikes dentro de ±1% do spot.
+    atm_mask = (nearest["strike"] / preco_btc - 1).abs() <= D_ATM_BAND_PCT
+    atm_oi = float(nearest.loc[atm_mask, "oi"].sum())
+    atm_oi_total = float(nearest["oi"].sum())
+    atm_oi_ratio = atm_oi / atm_oi_total if atm_oi_total > 0 else 0.0
+
+    # "Elevado" é relativo às expirações disponíveis, usando o mesmo critério ATM.
+    atm_por_exp = []
+    for expiry, grupo in df.groupby("expiry"):
+        mask = (grupo["strike"] / preco_btc - 1).abs() <= D_ATM_BAND_PCT
+        atm_por_exp.append(float(grupo.loc[mask, "oi"].sum()))
+    threshold = float(np.percentile(atm_por_exp, D_ATM_ELEVATED_PERCENTILE)) if atm_por_exp else 0.0
+    atm_elevado = atm_oi >= threshold and atm_oi > 0
+
+    dte_hours = float((nearest_expiry - agora_utc).total_seconds() / 3600)
+    gex_negativo = gex_proxy < D_GEX_NEGATIVE_THRESHOLD
+    dentro_janela = dte_hours <= D_MAX_DTE_HOURS
+
+    condicoes = []
+    if gex_negativo:
+        condicoes.append("GEX negativo")
+    else:
+        condicoes.append("GEX não negativo")
+    if atm_elevado:
+        condicoes.append("OI ATM elevado")
+    else:
+        condicoes.append("OI ATM não elevado")
+    if dentro_janela:
+        condicoes.append("expiração <= 24h")
+    else:
+        condicoes.append("expiração > 24h")
+
+    d_ativa = bool(gex_negativo and atm_elevado and dentro_janela)
+    gex_condition = "D ATIVA" if d_ativa else "D INATIVA"
 
     return {
-        "bids": bids,
-        "asks": asks,
-        "imbalance": imbalance,
+        "gex_proxy": gex_proxy,
+        "gex_calls": gex_calls,
+        "gex_puts": gex_puts,
+        "atm_oi": atm_oi,
+        "atm_oi_total": atm_oi_total,
+        "atm_oi_ratio": atm_oi_ratio,
+        "atm_oi_threshold": threshold,
+        "atm_elevado": atm_elevado,
+        "nearest_expiry": nearest_expiry.isoformat(),
+        "dte_hours": dte_hours,
+        "gex_negativo": gex_negativo,
+        "dentro_janela": dentro_janela,
+        "d_ativa": d_ativa,
+        "gex_condition": gex_condition,
+        "condicoes": condicoes,
     }
 
 # ============================================================
@@ -410,12 +735,10 @@ def buscar_orderbook():
 # ============================================================
 def calcular_indicadores(df):
     df = df.copy()
-
     df["ret_1"] = df["Close"].pct_change(1)
     df["ret_3"] = df["Close"].pct_change(3)
     df["ret_12"] = df["Close"].pct_change(12)
     df["ret_48"] = df["Close"].pct_change(48)
-
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
@@ -458,7 +781,6 @@ def calcular_indicadores(df):
     direction = np.sign(df["Close"].diff()).fillna(0)
     df["cvd"] = (direction * df["Volume"]).cumsum()
     df["cvd_delta"] = df["cvd"].diff()
-
     return df
 
 # ============================================================
@@ -484,44 +806,36 @@ def gerar_score(row, imbalance):
         add_compra(15, "EMA20 > EMA50")
     else:
         add_venda(15, "EMA20 <= EMA50")
-
     if row["Close"] > row["EMA200"]:
         add_compra(10, "Preço > EMA200")
     else:
         add_venda(10, "Preço <= EMA200")
-
     if row["ret_12"] > 0:
         add_compra(10, "Retorno 12 candles > 0")
     else:
         add_venda(10, "Retorno 12 candles <= 0")
-
     if row["ret_48"] > 0:
         add_compra(10, "Retorno 48 candles > 0")
     else:
         add_venda(10, "Retorno 48 candles <= 0")
-
     if 50 <= row["RSI"] <= 70:
         add_compra(10, "RSI entre 50 e 70")
     elif 30 <= row["RSI"] < 45:
         add_venda(10, "RSI entre 30 e 45")
     elif 45 <= row["RSI"] < 50:
         add_venda(5, "RSI entre 45 e 50")
-
     if row["volume_z"] > 1 and row["ret_1"] > 0:
         add_compra(10, "Volume Z > 1 com retorno positivo")
     elif row["volume_z"] > 1 and row["ret_1"] < 0:
         add_venda(10, "Volume Z > 1 com retorno negativo")
-
     if row["Close"] > row["VWAP"]:
         add_compra(10, "Preço > VWAP")
     else:
         add_venda(10, "Preço <= VWAP")
-
     if row["cvd_delta"] > 0:
         add_compra(10, "CVD delta > 0")
     elif row["cvd_delta"] < 0:
         add_venda(10, "CVD delta < 0")
-
     if imbalance > 0.10:
         add_compra(10, "Order book imbalance > 0,10")
     elif imbalance < -0.10:
@@ -541,33 +855,48 @@ def gerar_score(row, imbalance):
     else:
         regime = "LATERAL"
 
+    return compra, venda, sinal, regime, fatores_compra, fatores_venda
+
+
+def montar_motivo_entrada(side, score_compra, score_venda, regime, fatores_compra, fatores_venda, gex_data=None):
+    fatores = fatores_compra if side == "COMPRA" else fatores_venda
+    score = score_compra if side == "COMPRA" else score_venda
+    partes = [side, f"Score {score:.0f}", f"Regime {regime}"]
+    partes.extend(fatores)
+    if gex_data:
+        partes.extend(
+            [
+                f"GEX proxy {gex_data['gex_proxy']:+,.2f}",
+                f"OI ATM {gex_data['atm_oi']:,.2f}",
+                f"OI ATM ratio {gex_data['atm_oi_ratio']:.2%}",
+                f"DTE {gex_data['dte_hours']:.1f}h",
+            ]
+        )
+    return " | ".join(partes)
+
+
+def montar_motivo_dual_d(score_compra, score_venda, regime, gex_data):
     return (
-        compra,
-        venda,
-        sinal,
-        regime,
-        fatores_compra,
-        fatores_venda,
+        f"D DUAL/REVERSÃO | Score C {score_compra:.0f} | Score V {score_venda:.0f} | "
+        f"Regime {regime} | GEX proxy {gex_data['gex_proxy']:+,.2f} | "
+        f"OI ATM {gex_data['atm_oi']:,.2f} | OI ATM ratio {gex_data['atm_oi_ratio']:.2%} | "
+        f"DTE {gex_data['dte_hours']:.1f}h | "
+        + " | ".join(gex_data["condicoes"])
     )
 
 
-def montar_motivo_entrada(
-    side,
-    score_compra,
-    score_venda,
-    regime,
-    fatores_compra,
-    fatores_venda,
-):
+def montar_motivo_entrada_e(side, score_compra, score_venda, regime, fatores_compra, fatores_venda, ratio_data):
     fatores = fatores_compra if side == "COMPRA" else fatores_venda
     score = score_compra if side == "COMPRA" else score_venda
-
-    partes = [
-        side,
-        f"Score {score:.0f}",
-        f"Regime {regime}",
-    ]
+    partes = [f"E BRENT/WTI", side, f"Score {score:.0f}", f"Regime {regime}"]
     partes.extend(fatores)
+    partes.extend([
+        f"Brent ${ratio_data['brent_price']:.2f}",
+        f"WTI ${ratio_data['wti_price']:.2f}",
+        f"Ratio {ratio_data['ratio']:.4f}",
+        f"Ratio Z {ratio_data['z']:+.2f}",
+        ratio_data["condition"],
+    ])
     return " | ".join(partes)
 
 
@@ -580,100 +909,87 @@ def calcular_plano(side, preco, atr):
         target = preco - atr * ATR_TARGET_MULTIPLIER
     else:
         raise ValueError("Side inválido para cálculo do plano.")
-
     valido, mensagem = validar_plano(side, preco, stop, target)
     if not valido:
         raise ValueError(mensagem)
-
     return stop, target
 
 # ============================================================
-# SIMULAÇÃO DE BANCA
+# SIMULAÇÃO DA BANCA
 # ============================================================
 def simular_banca(historico, banca_inicial, percentual_entrada):
     if historico.empty:
         return pd.DataFrame(), float(banca_inicial)
-
-    df = historico.copy()
-    df = df[df["pnl_pct"].notna()].copy()
+    df = historico[historico["pnl_pct"].notna()].copy()
     if df.empty:
         return pd.DataFrame(), float(banca_inicial)
 
     df["entry_time_sort"] = pd.to_datetime(df["entry_time"], errors="coerce")
     df = df.sort_values(["entry_time_sort", "id"]).reset_index(drop=True)
-
     banca = float(banca_inicial)
-    registros = []
     taxa = float(percentual_entrada) / 100.0
+    registros = []
 
     for _, trade in df.iterrows():
         banca_antes = banca
         valor_entrada = banca_antes * taxa
         pnl_pct = float(trade["pnl_pct"])
         resultado_rs = valor_entrada * (pnl_pct / 100.0)
-        banca = banca_antes + resultado_rs
-
-        registros.append({
-            "#": int(trade["id"]),
-            "Lado": trade["side"],
-            "Entrada": trade["entry_time"],
-            "Saída": trade["exit_time"],
-            "P&L mercado %": pnl_pct,
-            "Banca antes": banca_antes,
-            "Entrada 1%": valor_entrada,
-            "Resultado R$": resultado_rs,
-            "Banca depois": banca,
-            "Resultado": trade["result"] if pd.notna(trade["result"]) else ("GANHO" if pnl_pct > 0 else "PERDA" if pnl_pct < 0 else "EMPATE"),
-            "Saída por": trade["exit_reason"] if pd.notna(trade.get("exit_reason")) else "-",
-        })
-
+        banca += resultado_rs
+        registros.append(
+            {
+                "#": int(trade["id"]),
+                "Estratégia": trade.get("strategy", "A") or "A",
+                "Ciclo": trade.get("cycle_id", "-") or "-",
+                "Lado": trade["side"],
+                "Entrada": trade["entry_time"],
+                "Saída": trade["exit_time"],
+                "P&L mercado %": pnl_pct,
+                "Banca antes": banca_antes,
+                "Entrada %": percentual_entrada,
+                "Valor entrada": valor_entrada,
+                "Resultado R$": resultado_rs,
+                "Banca depois": banca,
+                "Resultado": trade["result"] if pd.notna(trade["result"]) else "-",
+                "Saída por": trade["exit_reason"] if pd.notna(trade["exit_reason"]) else "-",
+            }
+        )
     return pd.DataFrame(registros), banca
-
 
 # ============================================================
 # INTERFACE
 # ============================================================
 st.title("₿ BTC Quant Trader — Paper Trading v2")
 st.caption(
-    "BTC/USDT • candles de 5 minutos • dados públicos Binance • sem ordens reais • banco: btc_trader_v2.db"
+    "BTC/USDT • 5 minutos • Binance + Deribit • paper trading • sem ordens reais • banco: btc_trader_v2.db"
 )
 
-# Sidebar
 with st.sidebar:
     st.header("Configuração")
-    max_operacoes = st.number_input(
-        "Máximo de operações abertas",
-        min_value=1,
-        max_value=50,
-        value=5,
-        step=1,
+    estrategia = st.selectbox(
+        "Estratégia automática",
+        ["A — Atual", "D — GEX + OI ATM + Expiração + Dual", "E — Brent/WTI + Sinal BTC"],
+        index=0,
+        help="A mantém seu robô original. D é um modo experimental baseado na hipótese de reversão em torno de expiração com GEX negativo e OI ATM elevado.",
     )
-    tempo_maximo = st.number_input(
-        "Tempo máximo por operação (min)",
-        min_value=5,
-        max_value=1440,
-        value=60,
-        step=5,
-    )
-    banca_inicial = st.number_input(
-        "Banca inicial da simulação (R$)",
-        min_value=1.0,
-        value=1000.0,
-        step=100.0,
-    )
-    percentual_entrada = st.number_input(
-        "Entrada por operação (% da banca)",
-        min_value=0.1,
-        max_value=100.0,
-        value=1.0,
-        step=0.1,
-    )
+    max_operacoes = st.number_input("Máximo de operações abertas", min_value=1, max_value=50, value=5, step=1)
+    tempo_maximo = st.number_input("Tempo máximo por operação (min)", min_value=5, max_value=1440, value=60, step=5)
+    banca_inicial = st.number_input("Banca inicial da simulação (R$)", min_value=1.0, value=1000.0, step=100.0)
+    percentual_entrada = st.number_input("Entrada por operação (% da banca)", min_value=0.1, max_value=100.0, value=1.0, step=0.1)
     st.divider()
     st.write(f"**Stop:** {ATR_STOP_MULTIPLIER:.1f} × ATR")
     st.write(f"**Alvo:** {ATR_TARGET_MULTIPLIER:.1f} × ATR")
     st.write(f"**Refresh:** {AUTO_REFRESH_SECONDS}s")
-    st.write("**Entrada:** somente sinal confirmado")
     st.write("**Banco:** `btc_trader_v2.db`")
+    if estrategia.startswith("D"):
+        st.info(
+            "D abre COMPRA + VENDA com 1 ATR de stop e 2 ATR de alvo quando: "
+            "GEX proxy < 0, OI ATM está no percentil 75%+ das expirações disponíveis e a próxima expiração está a até 24h."
+        )
+    if estrategia.startswith("E"):
+        st.info(
+            "E usa Brent/WTI como filtro de contexto. O ratio é Brent ÷ WTI; a entrada só é liberada quando |Z-score| >= 2,0 e o sinal técnico do BTC confirma COMPRA ou VENDA. O ratio não determina sozinho a direção."
+        )
 
 # ============================================================
 # MONITORAMENTO
@@ -681,56 +997,57 @@ with st.sidebar:
 @st.fragment(run_every=AUTO_REFRESH_SECONDS)
 def monitor():
     try:
-        df = buscar_klines()
+        df = calcular_indicadores(buscar_klines())
         preco_atual = buscar_preco()
         orderbook = buscar_orderbook()
-
-        df = calcular_indicadores(df)
-
-        # Último candle FECHADO. O último registro pode ainda estar em formação.
         row = df.iloc[-2]
         signal_time = row["close_time"]
 
-        (
-            score_compra,
-            score_venda,
-            sinal,
-            regime,
-            fatores_compra,
-            fatores_venda,
-        ) = gerar_score(row, orderbook["imbalance"])
-
-        # 4) Auditoria: tudo usado para gerar o sinal é salvo na entrada.
-        motivo_entrada = montar_motivo_entrada(
-            sinal,
-            score_compra,
-            score_venda,
-            regime,
-            fatores_compra,
-            fatores_venda,
-        )
-
-        # Monitora operações já abertas antes de procurar nova entrada.
+        score_compra, score_venda, sinal, regime, fatores_compra, fatores_venda = gerar_score(row, orderbook["imbalance"])
         fechadas = monitorar_operacoes(preco_atual, tempo_maximo)
         if fechadas:
-            st.toast(
-                " | ".join(f"#{trade_id}: {resultado}" for trade_id, resultado in fechadas)
-            )
+            st.toast(" | ".join(f"#{trade_id}: {resultado}" for trade_id, resultado in fechadas))
+
+        # GEX é consultado sempre para que a tela mostre o estado do mercado.
+        gex_data = None
+        gex_erro = None
+        try:
+            opcoes = buscar_opcoes_deribit()
+            gex_data = calcular_gex_proxy(opcoes, preco_atual)
+        except Exception as exc:
+            gex_erro = str(exc)
+
+        ratio_data = None
+        ratio_erro = None
+        try:
+            ratio_data = calcular_ratio_brent_wti()
+        except Exception as exc:
+            ratio_erro = str(exc)
+
+        if estrategia.startswith("E"):
+            sinal_e, motivo_e_status = estrategia_e_signal(sinal, ratio_data)
+        else:
+            sinal_e, motivo_e_status = sinal, ""
+
+        strategy_code = "D" if estrategia.startswith("D") else "E" if estrategia.startswith("E") else "A"
+        ciclo_criado = None
+        entradas_realizadas = []
 
         abertas = buscar_operacoes_abertas()
         quantidade_abertas = len(abertas)
 
-        # Entrada automática
-        if quantidade_abertas < int(max_operacoes):
-            if sinal in ["COMPRA", "VENDA"]:
-                if not entrada_ja_registrada(signal_time):
+        # ========================================================
+        # ESTRATÉGIA A — original
+        # ========================================================
+        if strategy_code == "A":
+            motivo = montar_motivo_entrada(sinal, score_compra, score_venda, regime, fatores_compra, fatores_venda)
+            if quantidade_abertas < int(max_operacoes) and sinal in ("COMPRA", "VENDA"):
+                if not entrada_ja_registrada(signal_time, strategy="A", side=sinal):
                     atr = float(row["ATR"])
-
                     if np.isfinite(atr) and atr > 0:
                         entrada = float(preco_atual)
                         stop, alvo = calcular_plano(sinal, entrada, atr)
                         score = score_compra if sinal == "COMPRA" else score_venda
-
                         trade_id = registrar_trade(
                             side=sinal,
                             entry_price=entrada,
@@ -744,34 +1061,111 @@ def monitor():
                             score_compra=score_compra,
                             score_venda=score_venda,
                             signal=sinal,
-                            entry_reason=motivo_entrada,
-                            notes="Entrada automática por sinal confirmado. Snapshot completo salvo para auditoria.",
+                            entry_reason=motivo,
+                            strategy="A",
+                            cycle_id=None,
+                            gex_data=gex_data,
+                            notes="Estratégia A — sinal confirmado. Snapshot salvo para auditoria.",
                         )
+                        entradas_realizadas.append(f"#{trade_id} A {sinal}")
 
-                        st.success(
-                            f"Nova operação #{trade_id}: {sinal} | "
-                            f"Entrada ${entrada:,.2f} | Score {score:.0f}"
-                        )
+        # ========================================================
+        # ESTRATÉGIA D — dual + GEX/OI/expiração
+        # ========================================================
+        elif strategy_code == "D":
+            d_ativa = bool(gex_data and gex_data.get("d_ativa"))
+            motivo_dual = montar_motivo_dual_d(score_compra, score_venda, regime, gex_data) if gex_data else "D indisponível: sem dados Deribit"
 
-                        # Recarrega para refletir a nova operação imediatamente.
-                        abertas = buscar_operacoes_abertas()
-                        quantidade_abertas = len(abertas)
+            # Um ciclo D abre as duas pernas. Cada perna usa 1% da banca na simulação.
+            if d_ativa and quantidade_abertas + 2 <= int(max_operacoes):
+                # Um único ciclo D por candle/sinal. Evita duplicação a cada refresh de 10s.
+                if not entrada_ja_registrada(signal_time, strategy="D"):
+                    ciclo_base = f"D-{pd.Timestamp(signal_time).strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+                    atr = float(row["ATR"])
+                    if np.isfinite(atr) and atr > 0:
+                        entrada = float(preco_atual)
+                        for lado in ("COMPRA", "VENDA"):
+                            stop, alvo = calcular_plano(lado, entrada, atr)
+                            trade_id = registrar_trade(
+                                side=lado,
+                                entry_price=entrada,
+                                stop_price=stop,
+                                target_price=alvo,
+                                score=max(score_compra, score_venda),
+                                regime=regime,
+                                signal_time=signal_time,
+                                row=row,
+                                imbalance=orderbook["imbalance"],
+                                score_compra=score_compra,
+                                score_venda=score_venda,
+                                signal="DUAL",
+                                entry_reason=motivo_dual,
+                                strategy="D",
+                                cycle_id=ciclo_base,
+                                gex_data=gex_data,
+                                notes="Estratégia D — ciclo dual baseado em GEX proxy negativo + OI ATM elevado + expiração <= 24h.",
+                            )
+                            entradas_realizadas.append(f"#{trade_id} D {lado}")
+                        ciclo_criado = ciclo_base
 
-        # --------------------------------------------------------
-        # Painel principal
-        # --------------------------------------------------------
+        # ========================================================
+        # ESTRATÉGIA E — Brent/WTI + sinal técnico BTC
+        # ========================================================
+        elif strategy_code == "E":
+            if ratio_data and ratio_data.get("ready"):
+                if sinal_e in ("COMPRA", "VENDA") and quantidade_abertas < int(max_operacoes):
+                    motivo_e = montar_motivo_entrada_e(
+                        sinal_e, score_compra, score_venda, regime,
+                        fatores_compra, fatores_venda, ratio_data
+                    )
+                    if not entrada_ja_registrada(signal_time, strategy="E", side=sinal_e):
+                        atr = float(row["ATR"])
+                        if np.isfinite(atr) and atr > 0:
+                            entrada = float(preco_atual)
+                            stop, alvo = calcular_plano(sinal_e, entrada, atr)
+                            score = score_compra if sinal_e == "COMPRA" else score_venda
+                            trade_id = registrar_trade(
+                                side=sinal_e,
+                                entry_price=entrada,
+                                stop_price=stop,
+                                target_price=alvo,
+                                score=score,
+                                regime=regime,
+                                signal_time=signal_time,
+                                row=row,
+                                imbalance=orderbook["imbalance"],
+                                score_compra=score_compra,
+                                score_venda=score_venda,
+                                signal=sinal_e,
+                                entry_reason=motivo_e,
+                                strategy="E",
+                                cycle_id=None,
+                                gex_data=gex_data,
+                                ratio_data=ratio_data,
+                                notes="Estratégia E — extremo do ratio Brent/WTI (|Z| >= 2) + confirmação técnica BTC.",
+                            )
+                            entradas_realizadas.append(f"#{trade_id} E {sinal_e}")
+            elif ratio_erro:
+                st.warning(f"Estratégia E indisponível: {ratio_erro}")
+
+        if entradas_realizadas:
+            st.success("Nova entrada: " + " | ".join(entradas_realizadas))
+
+        abertas = buscar_operacoes_abertas()
+        quantidade_abertas = len(abertas)
+
+        # ========================================================
+        # PAINEL
+        # ========================================================
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("BTC", f"${preco_atual:,.2f}")
-        c2.metric("Sinal", sinal)
+        c2.metric("Sinal técnico", sinal)
         c3.metric("Score COMPRA", f"{score_compra:.0f}")
         c4.metric("Score VENDA", f"{score_venda:.0f}")
         c5.metric("Regime", regime)
 
         st.divider()
-
-        # Sinal e plano
         left, right = st.columns([1.15, 1])
-
         with left:
             st.subheader("Sinal atual")
             if sinal == "COMPRA":
@@ -780,216 +1174,206 @@ def monitor():
                 st.error("🔴 VENDA")
             else:
                 st.info("🟡 AGUARDAR")
-
+            st.write(f"**Estratégia selecionada:** {estrategia}")
             st.write(f"**Candle analisado:** {signal_time}")
             st.write(f"**Preço do candle:** ${float(row['Close']):,.2f}")
             st.write(f"**Preço atual:** ${preco_atual:,.2f}")
             st.write(f"**Order book imbalance:** {orderbook['imbalance']:+.4f}")
-
-            if sinal in ["COMPRA", "VENDA"]:
-                try:
-                    stop_view, alvo_view = calcular_plano(sinal, preco_atual, float(row["ATR"]))
-                    st.write(f"**Stop:** ${stop_view:,.2f}")
-                    st.write(f"**Alvo:** ${alvo_view:,.2f}")
-                except ValueError as exc:
-                    st.warning(str(exc))
+            if sinal in ("COMPRA", "VENDA"):
+                stop_view, alvo_view = calcular_plano(sinal, preco_atual, float(row["ATR"]))
+                st.write(f"**Stop técnico:** ${stop_view:,.2f}")
+                st.write(f"**Alvo técnico:** ${alvo_view:,.2f}")
 
         with right:
-            st.subheader("Fatores do sinal")
-            if sinal == "COMPRA":
-                for fator in fatores_compra:
-                    st.write("•", fator)
-            elif sinal == "VENDA":
-                for fator in fatores_venda:
-                    st.write("•", fator)
+            st.subheader("GEX / Opções Deribit")
+            if gex_data:
+                g1, g2, g3 = st.columns(3)
+                g1.metric("GEX proxy", f"{gex_data['gex_proxy']:+,.0f}")
+                g2.metric("OI ATM", f"{gex_data['atm_oi']:,.1f}")
+                g3.metric("DTE", f"{gex_data['dte_hours']:.1f}h")
+                st.write(f"**Próxima expiração:** {gex_data['nearest_expiry']}")
+                st.write(f"**OI ATM ratio:** {gex_data['atm_oi_ratio']:.2%}")
+                st.write(f"**Percentil usado para OI elevado:** {D_ATM_ELEVATED_PERCENTILE:.0f}%")
+                st.write("**Condições:** " + " | ".join(gex_data["condicoes"]))
+                if gex_data["d_ativa"]:
+                    st.success("🟢 Estratégia D ATIVA")
+                else:
+                    st.info("⚪ Estratégia D INATIVA")
             else:
-                st.write("Nenhum lado atingiu os critérios de entrada.")
+                st.warning(f"GEX indisponível: {gex_erro}")
+
+        if estrategia.startswith("E"):
+            st.subheader("Brent / WTI — Estratégia E")
+            if ratio_data:
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Brent", f"${ratio_data['brent_price']:.2f}")
+                r2.metric("WTI", f"${ratio_data['wti_price']:.2f}")
+                r3.metric("Ratio", f"{ratio_data['ratio']:.4f}")
+                r4.metric("Z-score", "-" if ratio_data.get("z") is None else f"{ratio_data['z']:+.2f}")
+                st.write(f"**Condição:** {ratio_data['condition']}")
+                st.write(f"**Status E:** {motivo_e_status}")
+            else:
+                st.warning(f"Brent/WTI indisponível: {ratio_erro}")
 
         st.divider()
+        with st.expander("🔎 Fatores técnicos"):
+            fatores = fatores_compra if sinal == "COMPRA" else fatores_venda
+            if fatores:
+                for fator in fatores:
+                    st.write("•", fator)
+            else:
+                st.write("Nenhum fator direcional relevante.")
 
-        # Operações abertas
+        # ========================================================
+        # OPERAÇÕES ABERTAS
+        # ========================================================
         st.subheader(f"Operações abertas ({quantidade_abertas}/{int(max_operacoes)})")
-
         if abertas.empty:
             st.info("Nenhuma operação aberta.")
         else:
-            exibicao = abertas.copy()
-            exibicao["entry_price"] = exibicao["entry_price"].map(lambda x: f"${x:,.2f}")
-            exibicao["stop_price"] = exibicao["stop_price"].map(lambda x: f"${x:,.2f}")
-            exibicao["target_price"] = exibicao["target_price"].map(lambda x: f"${x:,.2f}")
+            exib = abertas.copy()
+            exib["Preço entrada"] = exib["entry_price"].map(lambda x: f"${x:,.2f}")
+            exib["Stop"] = exib["stop_price"].map(lambda x: f"${x:,.2f}")
+            exib["Alvo"] = exib["target_price"].map(lambda x: f"${x:,.2f}")
+            pnl_atual = []
+            for _, t in exib.iterrows():
+                entry = float(t["entry_price"])
+                pnl = ((preco_atual / entry) - 1) * 100 if t["side"] == "COMPRA" else ((entry / preco_atual) - 1) * 100
+                pnl_atual.append(pnl)
+            exib["P&L atual %"] = [f"{x:+.2f}%" for x in pnl_atual]
+            exib["Estratégia"] = exib["strategy"].fillna("A")
+            exib["Ciclo"] = exib["cycle_id"].fillna("-")
+            exib = exib.rename(columns={"id": "#", "side": "Lado", "entry_time": "Entrada", "score": "Score", "regime": "Regime"})
+            cols = ["#", "Estratégia", "Ciclo", "Lado", "Entrada", "Preço entrada", "Stop", "Alvo", "P&L atual %", "Score", "Regime"]
+            st.dataframe(exib[cols], use_container_width=True, hide_index=True)
 
-            def pnl_atual(row_trade):
-                if row_trade["side"] == "COMPRA":
-                    return ((preco_atual / float(row_trade["entry_price"].replace('$', '').replace(',', ''))) - 1) * 100
-                return ((float(row_trade["entry_price"].replace('$', '').replace(',', '')) / preco_atual) - 1) * 100
+        # ========================================================
+        # AUDITORIA
+        # ========================================================
+        with st.expander("🔎 Snapshot técnico / GEX para auditoria"):
+            audit = {
+                "EMA20": row["EMA20"], "EMA50": row["EMA50"], "EMA200": row["EMA200"],
+                "RSI": row["RSI"], "ATR": row["ATR"], "ret_1": row["ret_1"],
+                "ret_3": row["ret_3"], "ret_12": row["ret_12"], "ret_48": row["ret_48"],
+                "volatility": row["volatility"], "vol_z": row["vol_z"], "volume_ratio": row["volume_ratio"],
+                "volume_z": row["volume_z"], "VWAP": row["VWAP"], "cvd_delta": row["cvd_delta"],
+                "orderbook_imbalance": orderbook["imbalance"], "score_compra": score_compra,
+                "score_venda": score_venda, "regime": regime, "signal": sinal,
+                "signal_time": str(signal_time),
+            }
+            if gex_data:
+                audit.update({
+                    "gex_proxy": gex_data["gex_proxy"],
+                    "gex_calls": gex_data["gex_calls"],
+                    "gex_puts": gex_data["gex_puts"],
+                    "atm_oi": gex_data["atm_oi"],
+                    "atm_oi_total": gex_data["atm_oi_total"],
+                    "atm_oi_ratio": gex_data["atm_oi_ratio"],
+                    "nearest_expiry": gex_data["nearest_expiry"],
+                    "dte_hours": gex_data["dte_hours"],
+                    "D_ativa": gex_data["d_ativa"],
+                })
+            if ratio_data:
+                audit.update({
+                    "brent_price": ratio_data["brent_price"],
+                    "wti_price": ratio_data["wti_price"],
+                    "brent_wti_ratio": ratio_data["ratio"],
+                    "brent_wti_ratio_mean": ratio_data["ratio_mean"],
+                    "brent_wti_ratio_std": ratio_data["ratio_std"],
+                    "brent_wti_z": ratio_data["z"],
+                    "brent_wti_change": ratio_data["change"],
+                    "brent_wti_condition": ratio_data["condition"],
+                    "strategy_e_signal": sinal_e,
+                })
+            st.dataframe(pd.DataFrame(list(audit.items()), columns=["Indicador", "Valor"]), use_container_width=True, hide_index=True)
 
-            # Mantém P&L atual separado para não alterar a coluna original do banco.
-            exibicao["P&L atual %"] = [
-                pnl_atual(exibicao.iloc[i]) for i in range(len(exibicao))
-            ]
-            exibicao["P&L atual %"] = exibicao["P&L atual %"].map(lambda x: f"{x:+.2f}%")
-
-            exibicao = exibicao.rename(
-                columns={
-                    "id": "#",
-                    "side": "Lado",
-                    "entry_time": "Entrada",
-                    "entry_price": "Preço entrada",
-                    "stop_price": "Stop",
-                    "target_price": "Alvo",
-                    "score": "Score",
-                    "regime": "Regime",
-                }
-            )
-            colunas = [
-                "#", "Lado", "Entrada", "Preço entrada", "Stop", "Alvo",
-                "P&L atual %", "Score", "Regime",
-            ]
-            st.dataframe(exibicao[colunas], use_container_width=True, hide_index=True)
-
-        # --------------------------------------------------------
-        # Auditoria da última leitura
-        # --------------------------------------------------------
-        with st.expander("🔎 Snapshot do sinal atual / auditoria"):
-            audit = pd.DataFrame(
-                {
-                    "Indicador": [
-                        "EMA20", "EMA50", "EMA200", "RSI", "ATR",
-                        "ret_1", "ret_3", "ret_12", "ret_48", "volatility",
-                        "vol_z", "volume_ratio", "volume_z", "VWAP",
-                        "cvd_delta", "orderbook_imbalance", "score_compra",
-                        "score_venda", "regime", "signal", "signal_time",
-                    ],
-                    "Valor": [
-                        row["EMA20"], row["EMA50"], row["EMA200"], row["RSI"], row["ATR"],
-                        row["ret_1"], row["ret_3"], row["ret_12"], row["ret_48"], row["volatility"],
-                        row["vol_z"], row["volume_ratio"], row["volume_z"], row["VWAP"],
-                        row["cvd_delta"], orderbook["imbalance"], score_compra,
-                        score_venda, regime, sinal, str(signal_time),
-                    ],
-                }
-            )
-            st.dataframe(audit, use_container_width=True, hide_index=True)
-            if sinal in ["COMPRA", "VENDA"]:
-                st.markdown("**Motivo que será salvo se houver entrada:**")
-                st.code(motivo_entrada, language="text")
-
-        # --------------------------------------------------------
-        # Histórico
-        # --------------------------------------------------------
+        # ========================================================
+        # HISTÓRICO
+        # ========================================================
         st.subheader("Histórico")
-        historico = buscar_historico(100)
+        historico = buscar_historico(200)
         if historico.empty:
-            st.info("Ainda não existem operações no novo banco.")
+            st.info("Ainda não existem operações no banco.")
         else:
             hist = historico.copy()
-            hist = hist.rename(
-                columns={
-                    "id": "#",
-                    "side": "Lado",
-                    "entry_time": "Entrada",
-                    "entry_price": "Preço entrada",
-                    "stop_price": "Stop",
-                    "target_price": "Alvo",
-                    "exit_time": "Saída",
-                    "exit_price": "Preço saída",
-                    "pnl_pct": "P&L %",
-                    "result": "Resultado",
-                    "exit_reason": "Saída por",
-                    "score": "Score",
-                    "regime": "Regime",
-                    "signal": "Sinal",
-                }
-            )
-            hist["Resultado"] = hist["Resultado"].fillna("ABERTA")
-            hist["Saída por"] = hist["Saída por"].fillna("-")
-            hist["P&L %"] = hist["P&L %"].map(
-                lambda x: "-" if pd.isna(x) else f"{x:+.2f}%"
-            )
-            for col in ["Preço entrada", "Stop", "Alvo", "Preço saída"]:
-                if col in hist.columns:
-                    hist[col] = hist[col].map(
-                        lambda x: "-" if pd.isna(x) else f"${float(x):,.2f}"
-                    )
+            hist["Resultado"] = hist["result"].fillna("ABERTA")
+            hist["Saída por"] = hist["exit_reason"].fillna("-")
+            hist["Estratégia"] = hist["strategy"].fillna("A")
+            hist["Ciclo"] = hist["cycle_id"].fillna("-")
+            hist["P&L %"] = hist["pnl_pct"].map(lambda x: "-" if pd.isna(x) else f"{x:+.2f}%")
+            for col, label in [("entry_price", "Preço entrada"), ("stop_price", "Stop"), ("target_price", "Alvo"), ("exit_price", "Preço saída")]:
+                hist[label] = hist[col].map(lambda x: "-" if pd.isna(x) else f"${float(x):,.2f}")
+            hist = hist.rename(columns={"id": "#", "side": "Lado", "entry_time": "Entrada", "exit_time": "Saída", "score": "Score", "regime": "Regime"})
+            cols = ["#", "Estratégia", "Ciclo", "Lado", "Entrada", "Preço entrada", "Stop", "Alvo", "Saída", "Preço saída", "P&L %", "Resultado", "Saída por", "Score", "Regime"]
+            st.dataframe(hist[cols], use_container_width=True, hide_index=True)
 
-            hist_cols = [
-                "#", "Lado", "Entrada", "Preço entrada", "Stop", "Alvo",
-                "Saída", "Preço saída", "P&L %", "Resultado", "Saída por",
-                "Score", "Regime", "Sinal",
-            ]
-            st.dataframe(hist[hist_cols], use_container_width=True, hide_index=True)
-
-            # Simulação de banca: 1% da banca em cada operação.
-            sim, banca_final = simular_banca(historico, banca_inicial, percentual_entrada)
             st.markdown("### 💰 Simulação da banca")
+            sim, banca_final = simular_banca(historico, banca_inicial, percentual_entrada)
             st.caption(
-                f"Banca inicial: R$ {banca_inicial:,.2f} • "
-                f"Entrada: {percentual_entrada:.1f}% da banca em cada operação • "
-                "O lucro/prejuízo da operação é aplicado proporcionalmente ao valor da entrada."
+                f"Banca inicial: R$ {banca_inicial:,.2f} • Entrada: {percentual_entrada:.1f}% por operação • "
+                "Na D, COMPRA e VENDA são duas operações e cada uma usa o percentual definido."
             )
-
             if sim.empty:
-                st.info("A simulação aparecerá quando houver pelo menos uma operação fechada.")
+                st.info("A simulação aparecerá após a primeira operação fechada.")
             else:
-                ganhos_sim = int((sim["Resultado"] == "GANHO").sum())
-                perdas_sim = int((sim["Resultado"] == "PERDA").sum())
-                banca_inicial_sim = float(banca_inicial)
-                lucro_total_rs = banca_final - banca_inicial_sim
-                retorno_banca = (banca_final / banca_inicial_sim - 1) * 100 if banca_inicial_sim else 0
-
+                ganhos = int((sim["Resultado"] == "GANHO").sum())
+                perdas = int((sim["Resultado"] == "PERDA").sum())
+                lucro = banca_final - float(banca_inicial)
+                retorno = lucro / float(banca_inicial) * 100
                 b1, b2, b3, b4 = st.columns(4)
                 b1.metric("Banca atual", f"R$ {banca_final:,.2f}")
-                b2.metric("Lucro / prejuízo", f"R$ {lucro_total_rs:+,.2f}")
-                b3.metric("Retorno da banca", f"{retorno_banca:+.2f}%")
-                b4.metric("Ganhas / Perdidas", f"{ganhos_sim} / {perdas_sim}")
-
+                b2.metric("Lucro / prejuízo", f"R$ {lucro:+,.2f}")
+                b3.metric("Retorno", f"{retorno:+.2f}%")
+                b4.metric("Ganhas / Perdidas", f"{ganhos} / {perdas}")
                 sim_exib = sim.copy()
                 sim_exib["P&L mercado %"] = sim_exib["P&L mercado %"].map(lambda x: f"{x:+.2f}%")
-                for col in ["Banca antes", "Entrada 1%", "Resultado R$", "Banca depois"]:
+                for col in ["Banca antes", "Valor entrada", "Resultado R$", "Banca depois"]:
                     sim_exib[col] = sim_exib[col].map(lambda x: f"R$ {x:,.2f}")
-                sim_exib["Resultado"] = sim_exib["Resultado"].fillna("-")
                 st.dataframe(
-                    sim_exib[[
-                        "#", "Lado", "Entrada", "Saída", "P&L mercado %",
-                        "Banca antes", "Entrada 1%", "Resultado R$",
-                        "Banca depois", "Resultado", "Saída por",
-                    ]],
+                    sim_exib[["#", "Estratégia", "Ciclo", "Lado", "Entrada", "Saída", "P&L mercado %", "Banca antes", "Entrada %", "Valor entrada", "Resultado R$", "Banca depois", "Resultado", "Saída por"]],
                     use_container_width=True,
                     hide_index=True,
                 )
 
             ultimo = historico.iloc[0]
             with st.expander("📋 Motivo da última operação registrada"):
-                st.write(f"**Operação #{int(ultimo['id'])} — {ultimo['side']}**")
+                st.write(f"**Operação #{int(ultimo['id'])} — {ultimo['side']} — Estratégia {ultimo.get('strategy', 'A') or 'A'}**")
                 st.write(f"**Resultado:** {ultimo['result'] if pd.notna(ultimo['result']) else 'ABERTA'}")
-                if pd.notna(ultimo.get("exit_reason")):
-                    st.write(f"**Saída por:** {ultimo['exit_reason']}")
-                st.code(str(ultimo["entry_reason"]), language="text")
+                st.write(f"**Saída por:** {ultimo['exit_reason'] if pd.notna(ultimo['exit_reason']) else '-'}")
+                st.code(str(ultimo.get("entry_reason", "-")), language="text")
 
-        # --------------------------------------------------------
-        # Estatísticas
-        # --------------------------------------------------------
+        # ========================================================
+        # ESTATÍSTICAS
+        # ========================================================
         conn = get_conn()
         stats = pd.read_sql_query(
-            "SELECT COUNT(*) AS total, SUM(CASE WHEN result = 'GANHO' THEN 1 ELSE 0 END) AS ganhos, COALESCE(SUM(pnl_pct), 0) AS pnl_total FROM trades WHERE result IS NOT NULL",
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN result = 'GANHO' THEN 1 ELSE 0 END) AS ganhos,
+                SUM(CASE WHEN result = 'PERDA' THEN 1 ELSE 0 END) AS perdas,
+                COALESCE(SUM(pnl_pct), 0) AS pnl_total
+            FROM trades
+            WHERE result IS NOT NULL
+            """,
             conn,
         )
         conn.close()
-
         total = int(stats.iloc[0]["total"] or 0)
         ganhos = int(stats.iloc[0]["ganhos"] or 0)
+        perdas = int(stats.iloc[0]["perdas"] or 0)
         pnl_total = float(stats.iloc[0]["pnl_total"] or 0)
-        wr = (ganhos / total * 100) if total else 0
-
+        wr = ganhos / total * 100 if total else 0
         st.divider()
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("Operações fechadas", total)
         s2.metric("Ganhas", ganhos)
-        s3.metric("WR", f"{wr:.2f}%")
-        s4.metric("P&L acumulado", f"{pnl_total:+.2f}%")
+        s3.metric("Perdidas", perdas)
+        s4.metric("WR", f"{wr:.2f}%")
+        st.caption(f"P&L percentual acumulado das operações fechadas: {pnl_total:+.2f}%")
 
     except requests.RequestException as exc:
-        st.error(f"Erro ao consultar Binance: {exc}")
+        st.error(f"Erro ao consultar API: {exc}")
     except Exception as exc:
         st.error(f"Erro no monitoramento: {exc}")
 
