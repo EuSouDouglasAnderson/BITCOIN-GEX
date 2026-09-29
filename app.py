@@ -1099,7 +1099,7 @@ def calcular_gex_walls(opcoes, preco_btc):
     # strike <= spot
     #
     # Primeiro tentamos encontrar o maior
-```
+
 
 
 # ============================================================
