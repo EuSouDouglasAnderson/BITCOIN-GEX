@@ -205,6 +205,7 @@ def salvar_configuracoes():
         "tempo_maximo": int(st.session_state.get("cfg_tempo_maximo", 60)),
         "banca_inicial": float(st.session_state.get("cfg_banca_inicial", 1000.0)),
         "percentual_entrada": float(st.session_state.get("cfg_percentual_entrada", 1.0)),
+        "automatizar_todas": bool(st.session_state.get("cfg_automatizar_todas", True)),
     }
     conn = get_conn()
     try:
@@ -247,6 +248,7 @@ def inicializar_configuracoes_session():
     st.session_state["cfg_tempo_maximo"] = int(salvas.get("tempo_maximo", 60))
     st.session_state["cfg_banca_inicial"] = float(salvas.get("banca_inicial", 1000.0))
     st.session_state["cfg_percentual_entrada"] = float(salvas.get("percentual_entrada", 1.0))
+    st.session_state["cfg_automatizar_todas"] = str(salvas.get("automatizar_todas", "True")).lower() in ("1", "true", "sim", "yes")
     st.session_state["_configs_carregadas"] = True
 
     # Garante que valores antigos/inválidos não quebrem os widgets.
@@ -1272,7 +1274,7 @@ with st.sidebar:
     st.header("Configuração")
     st.caption("💾 As configurações são salvas automaticamente no banco.")
     estrategia = st.selectbox(
-        "Estratégia automática",
+        "Estratégia exibida no painel",
         [
             "A — Atual",
             "B — Reversão Bollinger + RSI + VWAP",
@@ -1284,6 +1286,17 @@ with st.sidebar:
         on_change=salvar_configuracoes,
         help="A = score técnico original; B = reversão à média; C = rompimento/momentum; D = GEX/OI/expiração; E = Brent/WTI como filtro.",
     )
+    automatizar_todas = st.checkbox(
+        "🤖 Automatizar as 5 estratégias",
+        key="cfg_automatizar_todas",
+        on_change=salvar_configuracoes,
+        help="Quando ativado, A, B, C, D e E são avaliadas a cada candle. A estratégia selecionada acima serve apenas para detalhar o painel.",
+    )
+    if automatizar_todas:
+        st.success("🤖 A + B + C + D + E estão operando automaticamente")
+    else:
+        st.warning("Modo individual: somente a estratégia selecionada será executada")
+
     max_operacoes = st.number_input(
         "Máximo de operações abertas",
         min_value=1, max_value=50, step=1,
@@ -1388,9 +1401,23 @@ def monitor():
         quantidade_abertas = len(abertas)
 
         # ========================================================
-        # ESTRATÉGIA A — original
+        # EXECUÇÃO AUTOMÁTICA DAS ESTRATÉGIAS
         # ========================================================
-        if strategy_code == "A":
+        # Quando automatizar_todas=True, cada estratégia é avaliada no mesmo
+        # candle. O limite de operações abertas continua global e a proteção
+        # entrada_ja_registrada impede duplicações a cada refresh.
+        estrategias_para_executar = ["A", "B", "C", "D", "E"] if automatizar_todas else [strategy_code]
+
+        sinais_estrategias = {
+            "A": sinal,
+            "B": estrategia_b_signal(row)[0],
+            "C": estrategia_c_signal(row)[0],
+            "D": "DUAL" if bool(gex_data and gex_data.get("d_ativa")) else "AGUARDAR",
+            "E": sinal_e,
+        }
+
+        # A — score técnico original
+        if "A" in estrategias_para_executar:
             motivo = montar_motivo_entrada(sinal, score_compra, score_venda, regime, fatores_compra, fatores_venda)
             if quantidade_abertas < int(max_operacoes) and sinal in ("COMPRA", "VENDA"):
                 if not entrada_ja_registrada(signal_time, strategy="A", side=sinal):
@@ -1400,30 +1427,18 @@ def monitor():
                         stop, alvo = calcular_plano(sinal, entrada, atr)
                         score = score_compra if sinal == "COMPRA" else score_venda
                         trade_id = registrar_trade(
-                            side=sinal,
-                            entry_price=entrada,
-                            stop_price=stop,
-                            target_price=alvo,
-                            score=score,
-                            regime=regime,
-                            signal_time=signal_time,
-                            row=row,
-                            imbalance=orderbook["imbalance"],
-                            score_compra=score_compra,
-                            score_venda=score_venda,
-                            signal=sinal,
-                            entry_reason=motivo,
-                            strategy="A",
-                            cycle_id=None,
-                            gex_data=gex_data,
+                            side=sinal, entry_price=entrada, stop_price=stop, target_price=alvo,
+                            score=score, regime=regime, signal_time=signal_time, row=row,
+                            imbalance=orderbook["imbalance"], score_compra=score_compra, score_venda=score_venda,
+                            signal=sinal, entry_reason=motivo, strategy="A", cycle_id=None,
+                            gex_data=gex_data, ratio_data=ratio_data,
                             notes="Estratégia A — sinal confirmado. Snapshot salvo para auditoria.",
                         )
                         entradas_realizadas.append(f"#{trade_id} A {sinal}")
+                        quantidade_abertas += 1
 
-        # ========================================================
-        # ESTRATÉGIA B — reversão à média
-        # ========================================================
-        elif strategy_code == "B":
+        # B — reversão Bollinger + RSI + VWAP
+        if "B" in estrategias_para_executar:
             sinal_b, motivo_b, fatores_b_compra, fatores_b_venda = estrategia_b_signal(row)
             if quantidade_abertas < int(max_operacoes) and sinal_b in ("COMPRA", "VENDA"):
                 if not entrada_ja_registrada(signal_time, strategy="B", side=sinal_b):
@@ -1434,31 +1449,18 @@ def monitor():
                         fatores_b = fatores_b_compra if sinal_b == "COMPRA" else fatores_b_venda
                         motivo = montar_motivo_entrada_bc("B", sinal_b, row, motivo_b, fatores_b)
                         trade_id = registrar_trade(
-                            side=sinal_b,
-                            entry_price=entrada,
-                            stop_price=stop,
-                            target_price=alvo,
-                            score=100.0,
-                            regime=regime,
-                            signal_time=signal_time,
-                            row=row,
-                            imbalance=orderbook["imbalance"],
-                            score_compra=100.0 if sinal_b == "COMPRA" else 0.0,
-                            score_venda=100.0 if sinal_b == "VENDA" else 0.0,
-                            signal=sinal_b,
-                            entry_reason=motivo,
-                            strategy="B",
-                            cycle_id=None,
-                            gex_data=gex_data,
-                            ratio_data=ratio_data,
+                            side=sinal_b, entry_price=entrada, stop_price=stop, target_price=alvo,
+                            score=100.0, regime=regime, signal_time=signal_time, row=row,
+                            imbalance=orderbook["imbalance"], score_compra=100.0 if sinal_b == "COMPRA" else 0.0,
+                            score_venda=100.0 if sinal_b == "VENDA" else 0.0, signal=sinal_b,
+                            entry_reason=motivo, strategy="B", cycle_id=None, gex_data=gex_data, ratio_data=ratio_data,
                             notes="Estratégia B — reversão à média com Bollinger + RSI + VWAP.",
                         )
                         entradas_realizadas.append(f"#{trade_id} B {sinal_b}")
+                        quantidade_abertas += 1
 
-        # ========================================================
-        # ESTRATÉGIA C — rompimento/momentum
-        # ========================================================
-        elif strategy_code == "C":
+        # C — rompimento Donchian + tendência + volume + ATR
+        if "C" in estrategias_para_executar:
             sinal_c, motivo_c, fatores_c_compra, fatores_c_venda = estrategia_c_signal(row)
             if quantidade_abertas < int(max_operacoes) and sinal_c in ("COMPRA", "VENDA"):
                 if not entrada_ja_registrada(signal_time, strategy="C", side=sinal_c):
@@ -1469,37 +1471,21 @@ def monitor():
                         fatores_c = fatores_c_compra if sinal_c == "COMPRA" else fatores_c_venda
                         motivo = montar_motivo_entrada_bc("C", sinal_c, row, motivo_c, fatores_c)
                         trade_id = registrar_trade(
-                            side=sinal_c,
-                            entry_price=entrada,
-                            stop_price=stop,
-                            target_price=alvo,
-                            score=100.0,
-                            regime=regime,
-                            signal_time=signal_time,
-                            row=row,
-                            imbalance=orderbook["imbalance"],
-                            score_compra=100.0 if sinal_c == "COMPRA" else 0.0,
-                            score_venda=100.0 if sinal_c == "VENDA" else 0.0,
-                            signal=sinal_c,
-                            entry_reason=motivo,
-                            strategy="C",
-                            cycle_id=None,
-                            gex_data=gex_data,
-                            ratio_data=ratio_data,
+                            side=sinal_c, entry_price=entrada, stop_price=stop, target_price=alvo,
+                            score=100.0, regime=regime, signal_time=signal_time, row=row,
+                            imbalance=orderbook["imbalance"], score_compra=100.0 if sinal_c == "COMPRA" else 0.0,
+                            score_venda=100.0 if sinal_c == "VENDA" else 0.0, signal=sinal_c,
+                            entry_reason=motivo, strategy="C", cycle_id=None, gex_data=gex_data, ratio_data=ratio_data,
                             notes="Estratégia C — rompimento Donchian + tendência + volume + ATR.",
                         )
                         entradas_realizadas.append(f"#{trade_id} C {sinal_c}")
+                        quantidade_abertas += 1
 
-        # ========================================================
-        # ESTRATÉGIA D — dual + GEX/OI/expiração
-        # ========================================================
-        elif strategy_code == "D":
+        # D — GEX + OI ATM + expiração; abre as duas pernas
+        if "D" in estrategias_para_executar:
             d_ativa = bool(gex_data and gex_data.get("d_ativa"))
             motivo_dual = montar_motivo_dual_d(score_compra, score_venda, regime, gex_data) if gex_data else "D indisponível: sem dados Deribit"
-
-            # Um ciclo D abre as duas pernas. Cada perna usa 1% da banca na simulação.
             if d_ativa and quantidade_abertas + 2 <= int(max_operacoes):
-                # Um único ciclo D por candle/sinal. Evita duplicação a cada refresh de 10s.
                 if not entrada_ja_registrada(signal_time, strategy="D"):
                     ciclo_base = f"D-{pd.Timestamp(signal_time).strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
                     atr = float(row["ATR"])
@@ -1508,31 +1494,19 @@ def monitor():
                         for lado in ("COMPRA", "VENDA"):
                             stop, alvo = calcular_plano(lado, entrada, atr)
                             trade_id = registrar_trade(
-                                side=lado,
-                                entry_price=entrada,
-                                stop_price=stop,
-                                target_price=alvo,
-                                score=max(score_compra, score_venda),
-                                regime=regime,
-                                signal_time=signal_time,
-                                row=row,
-                                imbalance=orderbook["imbalance"],
-                                score_compra=score_compra,
-                                score_venda=score_venda,
-                                signal="DUAL",
-                                entry_reason=motivo_dual,
-                                strategy="D",
-                                cycle_id=ciclo_base,
-                                gex_data=gex_data,
+                                side=lado, entry_price=entrada, stop_price=stop, target_price=alvo,
+                                score=max(score_compra, score_venda), regime=regime, signal_time=signal_time, row=row,
+                                imbalance=orderbook["imbalance"], score_compra=score_compra, score_venda=score_venda,
+                                signal="DUAL", entry_reason=motivo_dual, strategy="D", cycle_id=ciclo_base,
+                                gex_data=gex_data, ratio_data=ratio_data,
                                 notes="Estratégia D — ciclo dual baseado em GEX proxy negativo + OI ATM elevado + expiração <= 24h.",
                             )
                             entradas_realizadas.append(f"#{trade_id} D {lado}")
+                            quantidade_abertas += 1
                         ciclo_criado = ciclo_base
 
-        # ========================================================
-        # ESTRATÉGIA E — Brent/WTI + sinal técnico BTC
-        # ========================================================
-        elif strategy_code == "E":
+        # E — Brent/WTI + confirmação do sinal técnico BTC
+        if "E" in estrategias_para_executar:
             if ratio_data and ratio_data.get("ready"):
                 if sinal_e in ("COMPRA", "VENDA") and quantidade_abertas < int(max_operacoes):
                     motivo_e = montar_motivo_entrada_e(
@@ -1546,43 +1520,50 @@ def monitor():
                             stop, alvo = calcular_plano(sinal_e, entrada, atr)
                             score = score_compra if sinal_e == "COMPRA" else score_venda
                             trade_id = registrar_trade(
-                                side=sinal_e,
-                                entry_price=entrada,
-                                stop_price=stop,
-                                target_price=alvo,
-                                score=score,
-                                regime=regime,
-                                signal_time=signal_time,
-                                row=row,
-                                imbalance=orderbook["imbalance"],
-                                score_compra=score_compra,
-                                score_venda=score_venda,
-                                signal=sinal_e,
-                                entry_reason=motivo_e,
-                                strategy="E",
-                                cycle_id=None,
-                                gex_data=gex_data,
-                                ratio_data=ratio_data,
+                                side=sinal_e, entry_price=entrada, stop_price=stop, target_price=alvo,
+                                score=score, regime=regime, signal_time=signal_time, row=row,
+                                imbalance=orderbook["imbalance"], score_compra=score_compra, score_venda=score_venda,
+                                signal=sinal_e, entry_reason=motivo_e, strategy="E", cycle_id=None,
+                                gex_data=gex_data, ratio_data=ratio_data,
                                 notes="Estratégia E — extremo do ratio Brent/WTI (|Z| >= 2) + confirmação técnica BTC.",
                             )
                             entradas_realizadas.append(f"#{trade_id} E {sinal_e}")
-            elif ratio_erro:
+                            quantidade_abertas += 1
+            elif ratio_erro and "E" in estrategias_para_executar:
                 st.warning(f"Estratégia E indisponível: {ratio_erro}")
 
         if entradas_realizadas:
             st.success("Nova entrada: " + " | ".join(entradas_realizadas))
 
-        # Sinal operacional exibido no painel deve refletir a estratégia selecionada.
-        sinal_operacional = sinal
+        # O painel pode destacar uma estratégia, mas a automação não depende dela.
         if strategy_code == "B":
-            sinal_operacional = estrategia_b_signal(row)[0]
+            sinal_operacional = sinais_estrategias["B"]
         elif strategy_code == "C":
-            sinal_operacional = estrategia_c_signal(row)[0]
+            sinal_operacional = sinais_estrategias["C"]
+        elif strategy_code == "D":
+            sinal_operacional = sinais_estrategias["D"]
         elif strategy_code == "E":
-            sinal_operacional = sinal_e
+            sinal_operacional = sinais_estrategias["E"]
+        else:
+            sinal_operacional = sinais_estrategias["A"]
 
         abertas = buscar_operacoes_abertas()
         quantidade_abertas = len(abertas)
+
+        # ========================================================
+        # PAINEL
+        # ========================================================
+        if automatizar_todas:
+            df_sinais = pd.DataFrame([
+                {"Estratégia": "A — Atual", "Sinal": sinais_estrategias["A"]},
+                {"Estratégia": "B — Reversão", "Sinal": sinais_estrategias["B"]},
+                {"Estratégia": "C — Rompimento", "Sinal": sinais_estrategias["C"]},
+                {"Estratégia": "D — GEX/Dual", "Sinal": sinais_estrategias["D"]},
+                {"Estratégia": "E — Brent/WTI", "Sinal": sinais_estrategias["E"]},
+            ])
+            st.subheader("🤖 Automação — 5 estratégias")
+            st.dataframe(df_sinais, use_container_width=True, hide_index=True)
+            st.caption(f"Execução automática ativa. Limite global: {quantidade_abertas}/{int(max_operacoes)} operações abertas.")
 
         # ========================================================
         # PAINEL
