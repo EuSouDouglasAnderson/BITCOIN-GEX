@@ -37,6 +37,18 @@ E_RATIO_Z_THRESHOLD = 2.0
 E_RATIO_INTERVAL = "5m"
 E_RATIO_RANGE = "5d"
 
+# Estratégia B: reversão à média
+B_RSI_LOW = 30.0
+B_RSI_HIGH = 70.0
+B_BB_WINDOW = 20
+B_BB_STD = 2.0
+B_MIN_VWAP_DISTANCE = 0.003  # 0,30%
+
+# Estratégia C: rompimento/momentum
+C_DONCHIAN_WINDOW = 20
+C_VOLUME_Z_MIN = 1.0
+C_ATR_MIN_PCT = 0.001
+
 # ============================================================
 # PÁGINA / ESTILO
 # ============================================================
@@ -159,11 +171,93 @@ def criar_banco():
         if nome not in colunas:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {nome} {tipo}")
 
+    # Tabela separada para configurações persistentes da interface.
+    # Não altera nem apaga a tabela de trades existente.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
 
+def carregar_configuracoes():
+    """Carrega as últimas configurações salvas no SQLite."""
+    conn = get_conn()
+    try:
+        rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+        return {key: value for key, value in rows}
+    finally:
+        conn.close()
+
+
+def salvar_configuracoes():
+    """Persiste as configurações atuais da sidebar no SQLite."""
+    valores = {
+        "estrategia": st.session_state.get("cfg_estrategia", "A — Atual"),
+        "max_operacoes": int(st.session_state.get("cfg_max_operacoes", 5)),
+        "tempo_maximo": int(st.session_state.get("cfg_tempo_maximo", 60)),
+        "banca_inicial": float(st.session_state.get("cfg_banca_inicial", 1000.0)),
+        "percentual_entrada": float(st.session_state.get("cfg_percentual_entrada", 1.0)),
+    }
+    conn = get_conn()
+    try:
+        for key, value in valores.items():
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, str(value), agora()),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def inicializar_configuracoes_session():
+    """Inicializa os widgets com os valores persistidos apenas uma vez por sessão."""
+    if st.session_state.get("_configs_carregadas", False):
+        return
+
+    salvas = carregar_configuracoes()
+    estrategias = [
+        "A — Atual",
+        "B — Reversão Bollinger + RSI + VWAP",
+        "C — Rompimento Donchian + Volume",
+        "D — GEX + OI ATM + Expiração + Dual",
+        "E — Brent/WTI + Sinal BTC",
+    ]
+
+    estrategia_salva = salvas.get("estrategia", "A — Atual")
+    if estrategia_salva not in estrategias:
+        estrategia_salva = "A — Atual"
+
+    st.session_state["cfg_estrategia"] = estrategia_salva
+    st.session_state["cfg_max_operacoes"] = int(salvas.get("max_operacoes", 5))
+    st.session_state["cfg_tempo_maximo"] = int(salvas.get("tempo_maximo", 60))
+    st.session_state["cfg_banca_inicial"] = float(salvas.get("banca_inicial", 1000.0))
+    st.session_state["cfg_percentual_entrada"] = float(salvas.get("percentual_entrada", 1.0))
+    st.session_state["_configs_carregadas"] = True
+
+    # Garante que valores antigos/inválidos não quebrem os widgets.
+    st.session_state["cfg_max_operacoes"] = min(50, max(1, st.session_state["cfg_max_operacoes"]))
+    st.session_state["cfg_tempo_maximo"] = min(1440, max(5, st.session_state["cfg_tempo_maximo"]))
+    st.session_state["cfg_banca_inicial"] = max(1.0, st.session_state["cfg_banca_inicial"])
+    st.session_state["cfg_percentual_entrada"] = min(100.0, max(0.1, st.session_state["cfg_percentual_entrada"]))
+
+
 criar_banco()
+inicializar_configuracoes_session()
 
 # ============================================================
 # FUNÇÕES AUXILIARES
@@ -845,7 +939,153 @@ def calcular_indicadores(df):
     direction = np.sign(df["Close"].diff()).fillna(0)
     df["cvd"] = (direction * df["Volume"]).cumsum()
     df["cvd_delta"] = df["cvd"].diff()
+
+    # Bollinger Bands para a Estratégia B
+    df["BB_MID"] = df["Close"].rolling(B_BB_WINDOW).mean()
+    bb_std = df["Close"].rolling(B_BB_WINDOW).std()
+    df["BB_UPPER"] = df["BB_MID"] + B_BB_STD * bb_std
+    df["BB_LOWER"] = df["BB_MID"] - B_BB_STD * bb_std
+    df["BB_WIDTH"] = (df["BB_UPPER"] - df["BB_LOWER"]) / df["BB_MID"].replace(0, np.nan)
+
+    # Donchian usa apenas candles anteriores para evitar look-ahead.
+    df["DONCHIAN_HIGH"] = df["High"].shift(1).rolling(C_DONCHIAN_WINDOW).max()
+    df["DONCHIAN_LOW"] = df["Low"].shift(1).rolling(C_DONCHIAN_WINDOW).min()
+    df["ATR_PCT"] = df["ATR"] / df["Close"].replace(0, np.nan)
     return df
+
+# ============================================================
+# ESTRATÉGIAS B E C
+# ============================================================
+def estrategia_b_signal(row):
+    """
+    B — Reversão à média.
+    COMPRA: preço toca/rompe a banda inferior + RSI sobrevendido + distância
+    relevante abaixo do VWAP.
+    VENDA: espelho para banda superior/RSI sobrecomprado.
+    O sinal exige as 3 condições, evitando operar apenas por RSI.
+    """
+    fatores_compra = []
+    fatores_venda = []
+
+    valores = [row.get("RSI"), row.get("BB_LOWER"), row.get("BB_UPPER"), row.get("VWAP")]
+    if not all(pd.notna(x) for x in valores):
+        return "AGUARDAR", "B sem dados suficientes para RSI/Bollinger/VWAP.", [], []
+
+    close = float(row["Close"])
+    rsi = float(row["RSI"])
+    vwap = float(row["VWAP"])
+    bb_lower = float(row["BB_LOWER"])
+    bb_upper = float(row["BB_UPPER"])
+
+    dist_vwap = (close / vwap) - 1 if vwap else np.nan
+
+    compra = close <= bb_lower and rsi <= B_RSI_LOW and dist_vwap <= -B_MIN_VWAP_DISTANCE
+    venda = close >= bb_upper and rsi >= B_RSI_HIGH and dist_vwap >= B_MIN_VWAP_DISTANCE
+
+    if close <= bb_lower:
+        fatores_compra.append("Preço <= banda inferior Bollinger")
+    if rsi <= B_RSI_LOW:
+        fatores_compra.append(f"RSI <= {B_RSI_LOW:.0f}")
+    if np.isfinite(dist_vwap) and dist_vwap <= -B_MIN_VWAP_DISTANCE:
+        fatores_compra.append(f"Preço {abs(dist_vwap)*100:.2f}% abaixo do VWAP")
+
+    if close >= bb_upper:
+        fatores_venda.append("Preço >= banda superior Bollinger")
+    if rsi >= B_RSI_HIGH:
+        fatores_venda.append(f"RSI >= {B_RSI_HIGH:.0f}")
+    if np.isfinite(dist_vwap) and dist_vwap >= B_MIN_VWAP_DISTANCE:
+        fatores_venda.append(f"Preço {abs(dist_vwap)*100:.2f}% acima do VWAP")
+
+    if compra and not venda:
+        return "COMPRA", (
+            f"B REVERSÃO | RSI {rsi:.1f} | Close ${close:,.2f} | "
+            f"BB inferior ${bb_lower:,.2f} | VWAP ${vwap:,.2f} | "
+            f"dist. VWAP {dist_vwap*100:+.2f}%"
+        ), fatores_compra, fatores_venda
+    if venda and not compra:
+        return "VENDA", (
+            f"B REVERSÃO | RSI {rsi:.1f} | Close ${close:,.2f} | "
+            f"BB superior ${bb_upper:,.2f} | VWAP ${vwap:,.2f} | "
+            f"dist. VWAP {dist_vwap*100:+.2f}%"
+        ), fatores_compra, fatores_venda
+    return "AGUARDAR", (
+        f"B sem confirmação | RSI {rsi:.1f} | dist. VWAP {dist_vwap*100:+.2f}%"
+        if np.isfinite(dist_vwap) else "B sem confirmação."
+    ), fatores_compra, fatores_venda
+
+
+def estrategia_c_signal(row):
+    """
+    C — Rompimento/momentum.
+    O Donchian é calculado somente com candles anteriores.
+    Exige rompimento + tendência EMA20/EMA50 + volume acima da média + ATR
+    mínimo relativo ao preço.
+    """
+    campos = ["DONCHIAN_HIGH", "DONCHIAN_LOW", "EMA20", "EMA50", "volume_z", "ATR_PCT"]
+    if not all(pd.notna(row.get(c)) for c in campos):
+        return "AGUARDAR", "C sem dados suficientes para Donchian/tendência/volume/ATR.", [], []
+
+    close = float(row["Close"])
+    high_break = float(row["DONCHIAN_HIGH"])
+    low_break = float(row["DONCHIAN_LOW"])
+    volume_z = float(row["volume_z"])
+    atr_pct = float(row["ATR_PCT"])
+
+    tendencia_alta = float(row["EMA20"]) > float(row["EMA50"])
+    tendencia_baixa = float(row["EMA20"]) < float(row["EMA50"])
+    volume_ok = volume_z >= C_VOLUME_Z_MIN
+    volatilidade_ok = atr_pct >= C_ATR_MIN_PCT
+    rompimento_alta = close > high_break
+    rompimento_baixa = close < low_break
+
+    fatores_compra = []
+    fatores_venda = []
+    if rompimento_alta:
+        fatores_compra.append(f"Rompimento Donchian {C_DONCHIAN_WINDOW} acima de ${high_break:,.2f}")
+    if tendencia_alta:
+        fatores_compra.append("EMA20 > EMA50")
+    if volume_ok:
+        fatores_compra.append(f"Volume Z {volume_z:+.2f}")
+    if volatilidade_ok:
+        fatores_compra.append(f"ATR/Preço {atr_pct*100:.2f}%")
+
+    if rompimento_baixa:
+        fatores_venda.append(f"Rompimento Donchian {C_DONCHIAN_WINDOW} abaixo de ${low_break:,.2f}")
+    if tendencia_baixa:
+        fatores_venda.append("EMA20 < EMA50")
+    if volume_ok:
+        fatores_venda.append(f"Volume Z {volume_z:+.2f}")
+    if volatilidade_ok:
+        fatores_venda.append(f"ATR/Preço {atr_pct*100:.2f}%")
+
+    compra = rompimento_alta and tendencia_alta and volume_ok and volatilidade_ok
+    venda = rompimento_baixa and tendencia_baixa and volume_ok and volatilidade_ok
+
+    if compra and not venda:
+        return "COMPRA", (
+            f"C ROMPIMENTO | Close ${close:,.2f} > Donchian ${high_break:,.2f} | "
+            f"EMA20/50 alta | Volume Z {volume_z:+.2f} | ATR/Preço {atr_pct*100:.2f}%"
+        ), fatores_compra, fatores_venda
+    if venda and not compra:
+        return "VENDA", (
+            f"C ROMPIMENTO | Close ${close:,.2f} < Donchian ${low_break:,.2f} | "
+            f"EMA20/50 baixa | Volume Z {volume_z:+.2f} | ATR/Preço {atr_pct*100:.2f}%"
+        ), fatores_compra, fatores_venda
+    return "AGUARDAR", (
+        f"C sem confirmação | Close ${close:,.2f} | Donchian H ${high_break:,.2f} / L ${low_break:,.2f} | "
+        f"Volume Z {volume_z:+.2f}"
+    ), fatores_compra, fatores_venda
+
+
+def montar_motivo_entrada_bc(strategy_code, side, row, motivo, fatores):
+    score = 0
+    if strategy_code == "B":
+        score = 100 if side in ("COMPRA", "VENDA") else 0
+        prefixo = "B — REVERSÃO"
+    else:
+        score = 100 if side in ("COMPRA", "VENDA") else 0
+        prefixo = "C — ROMPIMENTO"
+    return f"{prefixo} | {motivo} | Fatores: " + " | ".join(fatores)
 
 # ============================================================
 # SCORE / SINAL
@@ -1030,21 +1270,59 @@ st.caption(
 
 with st.sidebar:
     st.header("Configuração")
+    st.caption("💾 As configurações são salvas automaticamente no banco.")
     estrategia = st.selectbox(
         "Estratégia automática",
-        ["A — Atual", "D — GEX + OI ATM + Expiração + Dual", "E — Brent/WTI + Sinal BTC"],
-        index=0,
-        help="A mantém seu robô original. D é um modo experimental baseado na hipótese de reversão em torno de expiração com GEX negativo e OI ATM elevado.",
+        [
+            "A — Atual",
+            "B — Reversão Bollinger + RSI + VWAP",
+            "C — Rompimento Donchian + Volume",
+            "D — GEX + OI ATM + Expiração + Dual",
+            "E — Brent/WTI + Sinal BTC",
+        ],
+        key="cfg_estrategia",
+        on_change=salvar_configuracoes,
+        help="A = score técnico original; B = reversão à média; C = rompimento/momentum; D = GEX/OI/expiração; E = Brent/WTI como filtro.",
     )
-    max_operacoes = st.number_input("Máximo de operações abertas", min_value=1, max_value=50, value=5, step=1)
-    tempo_maximo = st.number_input("Tempo máximo por operação (min)", min_value=5, max_value=1440, value=60, step=5)
-    banca_inicial = st.number_input("Banca inicial da simulação (R$)", min_value=1.0, value=1000.0, step=100.0)
-    percentual_entrada = st.number_input("Entrada por operação (% da banca)", min_value=0.1, max_value=100.0, value=1.0, step=0.1)
+    max_operacoes = st.number_input(
+        "Máximo de operações abertas",
+        min_value=1, max_value=50, step=1,
+        key="cfg_max_operacoes",
+        on_change=salvar_configuracoes,
+    )
+    tempo_maximo = st.number_input(
+        "Tempo máximo por operação (min)",
+        min_value=5, max_value=1440, step=5,
+        key="cfg_tempo_maximo",
+        on_change=salvar_configuracoes,
+    )
+    banca_inicial = st.number_input(
+        "Banca inicial da simulação (R$)",
+        min_value=1.0, step=100.0,
+        key="cfg_banca_inicial",
+        on_change=salvar_configuracoes,
+    )
+    percentual_entrada = st.number_input(
+        "Entrada por operação (% da banca)",
+        min_value=0.1, max_value=100.0, step=0.1,
+        key="cfg_percentual_entrada",
+        on_change=salvar_configuracoes,
+    )
     st.divider()
     st.write(f"**Stop:** {ATR_STOP_MULTIPLIER:.1f} × ATR")
     st.write(f"**Alvo:** {ATR_TARGET_MULTIPLIER:.1f} × ATR")
     st.write(f"**Refresh:** {AUTO_REFRESH_SECONDS}s")
     st.write("**Banco:** `btc_trader_v2.db`")
+    if estrategia.startswith("B"):
+        st.info(
+            "B busca reversão à média: COMPRA quando preço <= Bollinger inferior + RSI <= 30 + preço >= 0,30% abaixo do VWAP; "
+            "VENDA é o espelho. Todas as 3 condições precisam confirmar."
+        )
+    if estrategia.startswith("C"):
+        st.info(
+            "C busca rompimento: COMPRA acima da máxima Donchian dos 20 candles anteriores + EMA20 > EMA50 + Volume Z >= 1 + ATR/Preço >= 0,10%; "
+            "VENDA é o espelho."
+        )
     if estrategia.startswith("D"):
         st.info(
             "D abre COMPRA + VENDA com 1 ATR de stop e 2 ATR de alvo quando: "
@@ -1093,7 +1371,16 @@ def monitor():
         else:
             sinal_e, motivo_e_status = sinal, ""
 
-        strategy_code = "D" if estrategia.startswith("D") else "E" if estrategia.startswith("E") else "A"
+        if estrategia.startswith("B"):
+            strategy_code = "B"
+        elif estrategia.startswith("C"):
+            strategy_code = "C"
+        elif estrategia.startswith("D"):
+            strategy_code = "D"
+        elif estrategia.startswith("E"):
+            strategy_code = "E"
+        else:
+            strategy_code = "A"
         ciclo_criado = None
         entradas_realizadas = []
 
@@ -1132,6 +1419,76 @@ def monitor():
                             notes="Estratégia A — sinal confirmado. Snapshot salvo para auditoria.",
                         )
                         entradas_realizadas.append(f"#{trade_id} A {sinal}")
+
+        # ========================================================
+        # ESTRATÉGIA B — reversão à média
+        # ========================================================
+        elif strategy_code == "B":
+            sinal_b, motivo_b, fatores_b_compra, fatores_b_venda = estrategia_b_signal(row)
+            if quantidade_abertas < int(max_operacoes) and sinal_b in ("COMPRA", "VENDA"):
+                if not entrada_ja_registrada(signal_time, strategy="B", side=sinal_b):
+                    atr = float(row["ATR"])
+                    if np.isfinite(atr) and atr > 0:
+                        entrada = float(preco_atual)
+                        stop, alvo = calcular_plano(sinal_b, entrada, atr)
+                        fatores_b = fatores_b_compra if sinal_b == "COMPRA" else fatores_b_venda
+                        motivo = montar_motivo_entrada_bc("B", sinal_b, row, motivo_b, fatores_b)
+                        trade_id = registrar_trade(
+                            side=sinal_b,
+                            entry_price=entrada,
+                            stop_price=stop,
+                            target_price=alvo,
+                            score=100.0,
+                            regime=regime,
+                            signal_time=signal_time,
+                            row=row,
+                            imbalance=orderbook["imbalance"],
+                            score_compra=100.0 if sinal_b == "COMPRA" else 0.0,
+                            score_venda=100.0 if sinal_b == "VENDA" else 0.0,
+                            signal=sinal_b,
+                            entry_reason=motivo,
+                            strategy="B",
+                            cycle_id=None,
+                            gex_data=gex_data,
+                            ratio_data=ratio_data,
+                            notes="Estratégia B — reversão à média com Bollinger + RSI + VWAP.",
+                        )
+                        entradas_realizadas.append(f"#{trade_id} B {sinal_b}")
+
+        # ========================================================
+        # ESTRATÉGIA C — rompimento/momentum
+        # ========================================================
+        elif strategy_code == "C":
+            sinal_c, motivo_c, fatores_c_compra, fatores_c_venda = estrategia_c_signal(row)
+            if quantidade_abertas < int(max_operacoes) and sinal_c in ("COMPRA", "VENDA"):
+                if not entrada_ja_registrada(signal_time, strategy="C", side=sinal_c):
+                    atr = float(row["ATR"])
+                    if np.isfinite(atr) and atr > 0:
+                        entrada = float(preco_atual)
+                        stop, alvo = calcular_plano(sinal_c, entrada, atr)
+                        fatores_c = fatores_c_compra if sinal_c == "COMPRA" else fatores_c_venda
+                        motivo = montar_motivo_entrada_bc("C", sinal_c, row, motivo_c, fatores_c)
+                        trade_id = registrar_trade(
+                            side=sinal_c,
+                            entry_price=entrada,
+                            stop_price=stop,
+                            target_price=alvo,
+                            score=100.0,
+                            regime=regime,
+                            signal_time=signal_time,
+                            row=row,
+                            imbalance=orderbook["imbalance"],
+                            score_compra=100.0 if sinal_c == "COMPRA" else 0.0,
+                            score_venda=100.0 if sinal_c == "VENDA" else 0.0,
+                            signal=sinal_c,
+                            entry_reason=motivo,
+                            strategy="C",
+                            cycle_id=None,
+                            gex_data=gex_data,
+                            ratio_data=ratio_data,
+                            notes="Estratégia C — rompimento Donchian + tendência + volume + ATR.",
+                        )
+                        entradas_realizadas.append(f"#{trade_id} C {sinal_c}")
 
         # ========================================================
         # ESTRATÉGIA D — dual + GEX/OI/expiração
@@ -1215,6 +1572,15 @@ def monitor():
         if entradas_realizadas:
             st.success("Nova entrada: " + " | ".join(entradas_realizadas))
 
+        # Sinal operacional exibido no painel deve refletir a estratégia selecionada.
+        sinal_operacional = sinal
+        if strategy_code == "B":
+            sinal_operacional = estrategia_b_signal(row)[0]
+        elif strategy_code == "C":
+            sinal_operacional = estrategia_c_signal(row)[0]
+        elif strategy_code == "E":
+            sinal_operacional = sinal_e
+
         abertas = buscar_operacoes_abertas()
         quantidade_abertas = len(abertas)
 
@@ -1223,7 +1589,7 @@ def monitor():
         # ========================================================
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("BTC", f"${preco_atual:,.2f}")
-        c2.metric("Sinal técnico", sinal)
+        c2.metric("Sinal operacional", sinal_operacional)
         c3.metric("Score COMPRA", f"{score_compra:.0f}")
         c4.metric("Score VENDA", f"{score_venda:.0f}")
         c5.metric("Regime", regime)
@@ -1232,17 +1598,28 @@ def monitor():
         left, right = st.columns([1.15, 1])
         with left:
             st.subheader("Sinal atual")
-            if sinal == "COMPRA":
+            if sinal_operacional == "COMPRA":
                 st.success("🟢 COMPRA")
-            elif sinal == "VENDA":
+            elif sinal_operacional == "VENDA":
                 st.error("🔴 VENDA")
             else:
                 st.info("🟡 AGUARDAR")
             st.write(f"**Estratégia selecionada:** {estrategia}")
+            st.write(f"**Sinal técnico base A:** {sinal}")
             st.write(f"**Candle analisado:** {signal_time}")
             st.write(f"**Preço do candle:** ${float(row['Close']):,.2f}")
             st.write(f"**Preço atual:** ${preco_atual:,.2f}")
             st.write(f"**Order book imbalance:** {orderbook['imbalance']:+.4f}")
+            if strategy_code == "B":
+                sinal_b_view, motivo_b_view, _, _ = estrategia_b_signal(row)
+                st.write(f"**Sinal B:** {sinal_b_view}")
+                st.caption(motivo_b_view)
+                st.write(f"**BB inferior:** ${float(row['BB_LOWER']):,.2f} | **BB superior:** ${float(row['BB_UPPER']):,.2f}")
+            elif strategy_code == "C":
+                sinal_c_view, motivo_c_view, _, _ = estrategia_c_signal(row)
+                st.write(f"**Sinal C:** {sinal_c_view}")
+                st.caption(motivo_c_view)
+                st.write(f"**Donchian H:** ${float(row['DONCHIAN_HIGH']):,.2f} | **Donchian L:** ${float(row['DONCHIAN_LOW']):,.2f}")
             if sinal in ("COMPRA", "VENDA"):
                 stop_view, alvo_view = calcular_plano(sinal, preco_atual, float(row["ATR"]))
                 st.write(f"**Stop técnico:** ${stop_view:,.2f}")
