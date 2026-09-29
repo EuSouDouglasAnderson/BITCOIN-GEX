@@ -923,7 +923,7 @@ def calcular_gex_proxy(opcoes, preco_btc):
     }
 
 # ============================================================
-python
+
 # ESTRATÉGIA F — GEX WALLS / FIRST TOUCH
 # ============================================================
 def f_data_operacional():
