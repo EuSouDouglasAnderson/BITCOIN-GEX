@@ -1687,6 +1687,46 @@ def monitor():
         c4.metric("Score VENDA", f"{score_venda:.0f}")
         c5.metric("Regime", regime)
 
+        # ========================================================
+        # GRÁFICO DE CANDLES
+        # ========================================================
+        st.subheader("📈 BTC/USDT — Gráfico de 5 minutos")
+        try:
+            fig_candles = criar_grafico_candles(df, janela=100)
+
+            # Marca a última vela analisada pelo robô.
+            fig_candles.add_trace(go.Scatter(
+                x=[signal_time],
+                y=[float(row["Close"])],
+                mode="markers",
+                marker=dict(size=10, symbol="circle"),
+                name="Candle analisado",
+                hovertemplate="Candle analisado<br>%{x}<br>Preço: $%{y:,.2f}<extra></extra>",
+            ))
+
+            # Mostra no gráfico as operações atualmente abertas.
+            if not abertas.empty:
+                for _, trade in abertas.iterrows():
+                    entry = float(trade["entry_price"])
+                    stop = float(trade["stop_price"])
+                    alvo = float(trade["target_price"])
+                    lado = str(trade["side"])
+                    estrategia_trade = str(trade.get("strategy", "A") or "A")
+                    legenda = f"{estrategia_trade} {lado}"
+                    fig_candles.add_hline(y=entry, line_dash="solid", annotation_text=f"Entrada {legenda}")
+                    fig_candles.add_hline(y=stop, line_dash="dot", annotation_text=f"Stop {legenda}")
+                    fig_candles.add_hline(y=alvo, line_dash="dash", annotation_text=f"Alvo {legenda}")
+
+            fig_candles.update_layout(
+                height=620,
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+            )
+            st.plotly_chart(fig_candles, use_container_width=True, config={"displaylogo": False, "scrollZoom": True})
+            st.caption("Últimas 100 candles. As linhas de Entrada/Stop/Alvo aparecem quando existem operações abertas.")
+        except Exception as exc:
+            st.warning(f"Não foi possível montar o gráfico de candles: {exc}")
+
         st.divider()
         left, right = st.columns([1.15, 1])
         with left:
