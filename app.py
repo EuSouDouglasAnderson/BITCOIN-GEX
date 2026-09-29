@@ -923,6 +923,7 @@ def calcular_gex_proxy(opcoes, preco_btc):
     }
 
 # ============================================================
+```python
 # ESTRATÉGIA F — GEX WALLS / FIRST TOUCH
 # ============================================================
 def f_data_operacional():
@@ -937,15 +938,36 @@ def f_data_operacional():
 def calcular_gex_walls(opcoes, preco_btc):
     """Calcula Call Wall, Put Wall, Gamma Flip, Pin e centróide GEX.
 
-    É uma proxy baseada em OI + mark_iv + gamma Black-Scholes. A função usa
-    as expirações até 48h e concentra a leitura em strikes próximos do spot.
+    Proxy baseada em OI + mark_iv + gamma Black-Scholes.
+
+    Regras dos Walls:
+      - Put Wall  = maior concentração de put GEX em strikes <= spot
+      - Call Wall = maior concentração de call GEX em strikes >= spot
+
+    Dessa forma, a estrutura operacional fica:
+
+        Put Wall <= Spot <= Call Wall
+
+    quando existem candidatos válidos dos dois lados.
+
+    A função usa as expirações até F_MAX_DTE_HOURS e concentra
+    a leitura em strikes próximos do spot.
     """
     agora_utc = datetime.now(timezone.utc)
     spot = float(preco_btc)
+
+    if not np.isfinite(spot) or spot <= 0:
+        return None
+
     registros = []
+
+    # --------------------------------------------------------
+    # 1. CALCULA GEX INDIVIDUAL DAS OPÇÕES
+    # --------------------------------------------------------
     for item in opcoes:
         nome = item.get("instrument_name", "")
         tipo = str(item.get("option_type", "")).lower()
+
         if tipo not in ("call", "put"):
             if nome.endswith("-C"):
                 tipo = "call"
@@ -953,156 +975,132 @@ def calcular_gex_walls(opcoes, preco_btc):
                 tipo = "put"
             else:
                 continue
+
         try:
             strike = float(item.get("strike"))
             oi = float(item.get("open_interest"))
             exp_ms = float(item.get("expiration_timestamp"))
         except (TypeError, ValueError):
             continue
-        if not np.isfinite(strike) or not np.isfinite(oi) or oi <= 0 or not np.isfinite(exp_ms):
+
+        if (
+            not np.isfinite(strike)
+            or not np.isfinite(oi)
+            or oi <= 0
+            or not np.isfinite(exp_ms)
+        ):
             continue
+
         try:
-            expiry = datetime.fromtimestamp(exp_ms / 1000.0, tz=timezone.utc)
+            expiry = datetime.fromtimestamp(
+                exp_ms / 1000.0,
+                tz=timezone.utc
+            )
         except Exception:
             continue
-        dte_hours = (expiry - agora_utc).total_seconds() / 3600.0
+
+        dte_hours = (
+            expiry - agora_utc
+        ).total_seconds() / 3600.0
+
         if dte_hours < -1 or dte_hours > F_MAX_DTE_HOURS:
             continue
+
         iv = _normalizar_iv(item.get("mark_iv"))
+
         if not np.isfinite(iv):
             continue
-        gamma = _gamma_black_scholes(spot, strike, iv, max(dte_hours, 0.01) / (24.0 * 365.0))
+
+        gamma = _gamma_black_scholes(
+            spot,
+            strike,
+            iv,
+            max(dte_hours, 0.01) / (24.0 * 365.0)
+        )
+
         if not np.isfinite(gamma) or gamma <= 0:
             continue
+
         try:
-            contract_size = float(item.get("contract_size", 1.0))
+            contract_size = float(
+                item.get("contract_size", 1.0)
+            )
         except (TypeError, ValueError):
             contract_size = 1.0
+
         if not np.isfinite(contract_size) or contract_size <= 0:
             contract_size = 1.0
-        bruto = oi * contract_size * gamma * (spot ** 2) * 0.01
+
+        # Proxy de GEX
+        bruto = (
+            oi
+            * contract_size
+            * gamma
+            * (spot ** 2)
+            * 0.01
+        )
+
         registros.append({
-            "type": tipo, "strike": strike, "oi": oi,
+            "type": tipo,
+            "strike": strike,
+            "oi": oi,
             "gex": bruto if tipo == "call" else -bruto,
             "expiry": expiry,
         })
+
     if not registros:
         return None
+
     d = pd.DataFrame(registros)
-    d = d[(d["strike"] / spot - 1).abs() <= F_ATM_BAND_PCT].copy()
+
+    # --------------------------------------------------------
+    # 2. FILTRO ATM
+    # --------------------------------------------------------
+    d = d[
+        (d["strike"] / spot - 1).abs() <= F_ATM_BAND_PCT
+    ].copy()
+
     if d.empty:
         return None
-    por_strike = d.groupby("strike", as_index=False).agg(
-        net_gex=("gex", "sum"),
-        call_gex=("gex", lambda x: float(x[x > 0].sum())),
-        put_gex=("gex", lambda x: float(abs(x[x < 0].sum()))),
-        oi=("oi", "sum"),
-    ).sort_values("strike")
+
+    # --------------------------------------------------------
+    # 3. AGREGA GEX POR STRIKE
+    # --------------------------------------------------------
+    por_strike = (
+        d.groupby("strike", as_index=False)
+        .agg(
+            net_gex=("gex", "sum"),
+
+            # Apenas GEX positivo das Calls
+            call_gex=(
+                "gex",
+                lambda x: float(x[x > 0].sum())
+            ),
+
+            # Magnitude do GEX negativo das Puts
+            put_gex=(
+                "gex",
+                lambda x: float(abs(x[x < 0].sum()))
+            ),
+
+            oi=("oi", "sum"),
+        )
+        .sort_values("strike")
+        .reset_index(drop=True)
+    )
+
     if por_strike.empty:
         return None
-    call_wall = float(por_strike.loc[por_strike["call_gex"].idxmax(), "strike"])
-    put_wall = float(por_strike.loc[por_strike["put_gex"].idxmax(), "strike"])
-    pin_candidate = float(por_strike.loc[por_strike["oi"].idxmax(), "strike"])
-    total_abs = float(por_strike["net_gex"].abs().sum())
-    gamma_centroid = float((por_strike["strike"] * por_strike["net_gex"].abs()).sum() / total_abs) if total_abs > 0 else float(spot)
-    ordered = por_strike.reset_index(drop=True)
-    cumulative = ordered["net_gex"].cumsum()
-    crossings = []
-    for i in range(1, len(ordered)):
-        if cumulative.iloc[i - 1] == 0 or cumulative.iloc[i] == 0 or cumulative.iloc[i - 1] * cumulative.iloc[i] < 0:
-            crossings.append((abs(float(cumulative.iloc[i])), float(ordered.iloc[i]["strike"])))
-    if crossings:
-        gamma_flip = min(crossings, key=lambda x: x[0])[1]
-    else:
-        gamma_flip = float(ordered.loc[cumulative.abs().idxmin(), "strike"])
-    distance_pct = abs(call_wall - put_wall) / spot if spot else np.nan
-    return {
-        "call_wall": call_wall,
-        "put_wall": put_wall,
-        "gamma_flip": gamma_flip,
-        "pin_candidate": pin_candidate,
-        "gamma_centroid": gamma_centroid,
-        "walls_distance_pct": distance_pct,
-        "walls_spaced": bool(np.isfinite(distance_pct) and distance_pct >= F_MIN_WALL_DISTANCE_PCT),
-        "options_used": int(len(d)),
-    }
 
+    # --------------------------------------------------------
+    # 4. PUT WALL
+    # --------------------------------------------------------
+    # Put Wall precisa estar no lado de suporte:
+    # strike <= spot
+    #
+    # Primeiro tentamos encontrar o maior
+```
 
-def f_buscar_estado():
-    data_op, _ = f_data_operacional()
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM f_day_state WHERE operational_date = ?", (data_op,)).fetchone()
-    cols = [d[1] for d in conn.execute("PRAGMA table_info(f_day_state)").fetchall()]
-    conn.close()
-    return dict(zip(cols, row)) if row else None
-
-
-def f_criar_snapshot(walls):
-    data_op, _ = f_data_operacional()
-    if not walls:
-        return None
-    existente = f_buscar_estado()
-    if existente:
-        return existente
-    conn = get_conn()
-    conn.execute(
-        """INSERT OR IGNORE INTO f_day_state
-        (operational_date, call_wall, put_wall, gamma_flip, pin_candidate, gamma_centroid,
-         first_touch_done, first_touch_time, first_touch_wall, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)""",
-        (data_op, walls["call_wall"], walls["put_wall"], walls["gamma_flip"],
-         walls["pin_candidate"], walls["gamma_centroid"], agora()),
-    )
-    conn.commit()
-    conn.close()
-    return f_buscar_estado()
-
-
-def f_marcar_primeiro_toque(wall_name, signal_time):
-    data_op, _ = f_data_operacional()
-    conn = get_conn()
-    conn.execute(
-        "UPDATE f_day_state SET first_touch_done = 1, first_touch_time = ?, first_touch_wall = ? WHERE operational_date = ?",
-        (str(signal_time), wall_name, data_op),
-    )
-    conn.commit()
-    conn.close()
-
-
-def estrategia_f_signal(row, estado_f):
-    """F: somente o primeiro toque do dia pode gerar entrada.
-
-    Put Wall + reação para cima = COMPRA; Call Wall + reação para baixo = VENDA.
-    Se a primeira vela tocar uma parede sem confirmação, o dia fica bloqueado,
-    respeitando a regra de não entrar em um segundo toque.
-    """
-    if not estado_f:
-        return "AGUARDAR", "F sem snapshot diário de GEX Walls.", [], []
-    if int(estado_f.get("first_touch_done") or 0):
-        return "AGUARDAR", f"F bloqueada: primeiro toque do dia já ocorreu ({estado_f.get('first_touch_wall') or '-'}).", [], []
-    try:
-        call_wall = float(estado_f["call_wall"])
-        put_wall = float(estado_f["put_wall"])
-        high = float(row["High"])
-        low = float(row["Low"])
-        close = float(row["Close"])
-    except (TypeError, ValueError, KeyError):
-        return "AGUARDAR", "F sem dados suficientes para identificar o toque.", [], []
-    put_touch = low <= put_wall <= high
-    call_touch = low <= call_wall <= high
-    fatores_compra = [f"Put Wall ${put_wall:,.2f}"] if put_touch else []
-    fatores_venda = [f"Call Wall ${call_wall:,.2f}"] if call_touch else []
-    if put_touch and call_touch:
-        return "BLOQUEAR", "F: a mesma vela tocou Put Wall e Call Wall; primeiro toque ambíguo, sem entrada.", fatores_compra, fatores_venda
-    if put_touch:
-        if close >= put_wall:
-            return "COMPRA", f"F SNIPER | Primeiro toque Put Wall ${put_wall:,.2f} | Fechamento ${close:,.2f} acima da parede.", fatores_compra, fatores_venda
-        return "AGUARDAR", f"F: primeiro toque no Put Wall ${put_wall:,.2f}, mas fechamento ${close:,.2f} não confirmou reação compradora.", fatores_compra, fatores_venda
-    if call_touch:
-        if close <= call_wall:
-            return "VENDA", f"F SNIPER | Primeiro toque Call Wall ${call_wall:,.2f} | Fechamento ${close:,.2f} abaixo da parede.", fatores_compra, fatores_venda
-        return "AGUARDAR", f"F: primeiro toque no Call Wall ${call_wall:,.2f}, mas fechamento ${close:,.2f} não confirmou reação vendedora.", fatores_compra, fatores_venda
-    return "AGUARDAR", f"F aguardando primeiro toque | Put ${put_wall:,.2f} | Call ${call_wall:,.2f}", fatores_compra, fatores_venda
 
 # ============================================================
 # INDICADORES
