@@ -1,6 +1,7 @@
 import sqlite3
 import math
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import uuid
 
 import numpy as np
@@ -49,6 +50,13 @@ B_MIN_VWAP_DISTANCE = 0.003  # 0,30%
 C_DONCHIAN_WINDOW = 20
 C_VOLUME_Z_MIN = 1.0
 C_ATR_MIN_PCT = 0.001
+
+# Estratégia F — GEX Walls / First Touch (Sniper A Seco)
+F_BRASILIA_TZ = "America/Sao_Paulo"
+F_SESSION_START_HOUR = 5
+F_MAX_DTE_HOURS = 48.0
+F_ATM_BAND_PCT = 0.05
+F_MIN_WALL_DISTANCE_PCT = 0.005
 
 # ============================================================
 # PÁGINA / ESTILO
@@ -172,6 +180,25 @@ def criar_banco():
         if nome not in colunas:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {nome} {tipo}")
 
+    # Estado persistente da Estratégia F: um snapshot de paredes por dia
+    # operacional e, principalmente, o bloqueio do segundo toque.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS f_day_state (
+            operational_date TEXT PRIMARY KEY,
+            call_wall REAL,
+            put_wall REAL,
+            gamma_flip REAL,
+            pin_candidate REAL,
+            gamma_centroid REAL,
+            first_touch_done INTEGER DEFAULT 0,
+            first_touch_time TEXT,
+            first_touch_wall TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     # Tabela separada para configurações persistentes da interface.
     # Não altera nem apaga a tabela de trades existente.
     conn.execute(
@@ -238,6 +265,7 @@ def inicializar_configuracoes_session():
         "C — Rompimento Donchian + Volume",
         "D — GEX + OI ATM + Expiração + Dual",
         "E — Brent/WTI + Sinal BTC",
+        "F — GEX Walls / First Touch",
     ]
 
     estrategia_salva = salvas.get("estrategia", "A — Atual")
@@ -895,6 +923,188 @@ def calcular_gex_proxy(opcoes, preco_btc):
     }
 
 # ============================================================
+# ESTRATÉGIA F — GEX WALLS / FIRST TOUCH
+# ============================================================
+def f_data_operacional():
+    """Dia operacional F: começa às 05:00 no horário de Brasília."""
+    agora_sp = datetime.now(timezone.utc).astimezone(ZoneInfo(F_BRASILIA_TZ))
+    data = agora_sp.date()
+    if agora_sp.hour < F_SESSION_START_HOUR:
+        data = data - timedelta(days=1)
+    return data.isoformat(), agora_sp
+
+
+def calcular_gex_walls(opcoes, preco_btc):
+    """Calcula Call Wall, Put Wall, Gamma Flip, Pin e centróide GEX.
+
+    É uma proxy baseada em OI + mark_iv + gamma Black-Scholes. A função usa
+    as expirações até 48h e concentra a leitura em strikes próximos do spot.
+    """
+    agora_utc = datetime.now(timezone.utc)
+    spot = float(preco_btc)
+    registros = []
+    for item in opcoes:
+        nome = item.get("instrument_name", "")
+        tipo = str(item.get("option_type", "")).lower()
+        if tipo not in ("call", "put"):
+            if nome.endswith("-C"):
+                tipo = "call"
+            elif nome.endswith("-P"):
+                tipo = "put"
+            else:
+                continue
+        try:
+            strike = float(item.get("strike"))
+            oi = float(item.get("open_interest"))
+            exp_ms = float(item.get("expiration_timestamp"))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(strike) or not np.isfinite(oi) or oi <= 0 or not np.isfinite(exp_ms):
+            continue
+        try:
+            expiry = datetime.fromtimestamp(exp_ms / 1000.0, tz=timezone.utc)
+        except Exception:
+            continue
+        dte_hours = (expiry - agora_utc).total_seconds() / 3600.0
+        if dte_hours < -1 or dte_hours > F_MAX_DTE_HOURS:
+            continue
+        iv = _normalizar_iv(item.get("mark_iv"))
+        if not np.isfinite(iv):
+            continue
+        gamma = _gamma_black_scholes(spot, strike, iv, max(dte_hours, 0.01) / (24.0 * 365.0))
+        if not np.isfinite(gamma) or gamma <= 0:
+            continue
+        try:
+            contract_size = float(item.get("contract_size", 1.0))
+        except (TypeError, ValueError):
+            contract_size = 1.0
+        if not np.isfinite(contract_size) or contract_size <= 0:
+            contract_size = 1.0
+        bruto = oi * contract_size * gamma * (spot ** 2) * 0.01
+        registros.append({
+            "type": tipo, "strike": strike, "oi": oi,
+            "gex": bruto if tipo == "call" else -bruto,
+            "expiry": expiry,
+        })
+    if not registros:
+        return None
+    d = pd.DataFrame(registros)
+    d = d[(d["strike"] / spot - 1).abs() <= F_ATM_BAND_PCT].copy()
+    if d.empty:
+        return None
+    por_strike = d.groupby("strike", as_index=False).agg(
+        net_gex=("gex", "sum"),
+        call_gex=("gex", lambda x: float(x[x > 0].sum())),
+        put_gex=("gex", lambda x: float(abs(x[x < 0].sum()))),
+        oi=("oi", "sum"),
+    ).sort_values("strike")
+    if por_strike.empty:
+        return None
+    call_wall = float(por_strike.loc[por_strike["call_gex"].idxmax(), "strike"])
+    put_wall = float(por_strike.loc[por_strike["put_gex"].idxmax(), "strike"])
+    pin_candidate = float(por_strike.loc[por_strike["oi"].idxmax(), "strike"])
+    total_abs = float(por_strike["net_gex"].abs().sum())
+    gamma_centroid = float((por_strike["strike"] * por_strike["net_gex"].abs()).sum() / total_abs) if total_abs > 0 else float(spot)
+    ordered = por_strike.reset_index(drop=True)
+    cumulative = ordered["net_gex"].cumsum()
+    crossings = []
+    for i in range(1, len(ordered)):
+        if cumulative.iloc[i - 1] == 0 or cumulative.iloc[i] == 0 or cumulative.iloc[i - 1] * cumulative.iloc[i] < 0:
+            crossings.append((abs(float(cumulative.iloc[i])), float(ordered.iloc[i]["strike"])))
+    if crossings:
+        gamma_flip = min(crossings, key=lambda x: x[0])[1]
+    else:
+        gamma_flip = float(ordered.loc[cumulative.abs().idxmin(), "strike"])
+    distance_pct = abs(call_wall - put_wall) / spot if spot else np.nan
+    return {
+        "call_wall": call_wall,
+        "put_wall": put_wall,
+        "gamma_flip": gamma_flip,
+        "pin_candidate": pin_candidate,
+        "gamma_centroid": gamma_centroid,
+        "walls_distance_pct": distance_pct,
+        "walls_spaced": bool(np.isfinite(distance_pct) and distance_pct >= F_MIN_WALL_DISTANCE_PCT),
+        "options_used": int(len(d)),
+    }
+
+
+def f_buscar_estado():
+    data_op, _ = f_data_operacional()
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM f_day_state WHERE operational_date = ?", (data_op,)).fetchone()
+    cols = [d[1] for d in conn.execute("PRAGMA table_info(f_day_state)").fetchall()]
+    conn.close()
+    return dict(zip(cols, row)) if row else None
+
+
+def f_criar_snapshot(walls):
+    data_op, _ = f_data_operacional()
+    if not walls:
+        return None
+    existente = f_buscar_estado()
+    if existente:
+        return existente
+    conn = get_conn()
+    conn.execute(
+        """INSERT OR IGNORE INTO f_day_state
+        (operational_date, call_wall, put_wall, gamma_flip, pin_candidate, gamma_centroid,
+         first_touch_done, first_touch_time, first_touch_wall, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)""",
+        (data_op, walls["call_wall"], walls["put_wall"], walls["gamma_flip"],
+         walls["pin_candidate"], walls["gamma_centroid"], agora()),
+    )
+    conn.commit()
+    conn.close()
+    return f_buscar_estado()
+
+
+def f_marcar_primeiro_toque(wall_name, signal_time):
+    data_op, _ = f_data_operacional()
+    conn = get_conn()
+    conn.execute(
+        "UPDATE f_day_state SET first_touch_done = 1, first_touch_time = ?, first_touch_wall = ? WHERE operational_date = ?",
+        (str(signal_time), wall_name, data_op),
+    )
+    conn.commit()
+    conn.close()
+
+
+def estrategia_f_signal(row, estado_f):
+    """F: somente o primeiro toque do dia pode gerar entrada.
+
+    Put Wall + reação para cima = COMPRA; Call Wall + reação para baixo = VENDA.
+    Se a primeira vela tocar uma parede sem confirmação, o dia fica bloqueado,
+    respeitando a regra de não entrar em um segundo toque.
+    """
+    if not estado_f:
+        return "AGUARDAR", "F sem snapshot diário de GEX Walls.", [], []
+    if int(estado_f.get("first_touch_done") or 0):
+        return "AGUARDAR", f"F bloqueada: primeiro toque do dia já ocorreu ({estado_f.get('first_touch_wall') or '-'}).", [], []
+    try:
+        call_wall = float(estado_f["call_wall"])
+        put_wall = float(estado_f["put_wall"])
+        high = float(row["High"])
+        low = float(row["Low"])
+        close = float(row["Close"])
+    except (TypeError, ValueError, KeyError):
+        return "AGUARDAR", "F sem dados suficientes para identificar o toque.", [], []
+    put_touch = low <= put_wall <= high
+    call_touch = low <= call_wall <= high
+    fatores_compra = [f"Put Wall ${put_wall:,.2f}"] if put_touch else []
+    fatores_venda = [f"Call Wall ${call_wall:,.2f}"] if call_touch else []
+    if put_touch and call_touch:
+        return "BLOQUEAR", "F: a mesma vela tocou Put Wall e Call Wall; primeiro toque ambíguo, sem entrada.", fatores_compra, fatores_venda
+    if put_touch:
+        if close >= put_wall:
+            return "COMPRA", f"F SNIPER | Primeiro toque Put Wall ${put_wall:,.2f} | Fechamento ${close:,.2f} acima da parede.", fatores_compra, fatores_venda
+        return "AGUARDAR", f"F: primeiro toque no Put Wall ${put_wall:,.2f}, mas fechamento ${close:,.2f} não confirmou reação compradora.", fatores_compra, fatores_venda
+    if call_touch:
+        if close <= call_wall:
+            return "VENDA", f"F SNIPER | Primeiro toque Call Wall ${call_wall:,.2f} | Fechamento ${close:,.2f} abaixo da parede.", fatores_compra, fatores_venda
+        return "AGUARDAR", f"F: primeiro toque no Call Wall ${call_wall:,.2f}, mas fechamento ${close:,.2f} não confirmou reação vendedora.", fatores_compra, fatores_venda
+    return "AGUARDAR", f"F aguardando primeiro toque | Put ${put_wall:,.2f} | Call ${call_wall:,.2f}", fatores_compra, fatores_venda
+
+# ============================================================
 # INDICADORES
 # ============================================================
 def calcular_indicadores(df):
@@ -1297,89 +1507,6 @@ def criar_grafico_candles(df, janela=100):
     return fig
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def buscar_klines_historico(limite_total=50000):
-    """Busca histórico de 5m em páginas. Usado somente no backtest."""
-    cols = ["open_time","Open","High","Low","Close","Volume","close_time","quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"]
-    todos = []
-    end_time = None
-    restante = int(limite_total)
-    while restante > 0:
-        n = min(1000, restante)
-        params = {"symbol": SYMBOL, "interval": INTERVAL, "limit": n}
-        if end_time is not None:
-            params["endTime"] = end_time
-        r = requests.get(f"{BINANCE_API}/api/v3/klines", params=params, timeout=15)
-        r.raise_for_status()
-        lote = r.json()
-        if not lote:
-            break
-        todos = lote + todos
-        restante -= len(lote)
-        first_open = int(lote[0][0])
-        end_time = first_open - 1
-        if len(lote) < n:
-            break
-    df = pd.DataFrame(todos, columns=cols).drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
-    for col in ["Open","High","Low","Close","Volume","quote_volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-    return df
-
-
-def backtest_bc(df, strategy_code, max_trades=1000):
-    """Backtest objetivo de B/C com stop 1 ATR e alvo 2 ATR. Sem look-ahead no Donchian."""
-    d = calcular_indicadores(df.copy()).reset_index(drop=True)
-    resultados = []
-    i = 0
-    while i < len(d) - 2 and len(resultados) < max_trades:
-        row = d.iloc[i]
-        if strategy_code == "B":
-            sinal_bt, *_ = estrategia_b_signal(row)
-        else:
-            sinal_bt, *_ = estrategia_c_signal(row)
-        if sinal_bt not in ("COMPRA", "VENDA") or not np.isfinite(row.get("ATR", np.nan)) or row["ATR"] <= 0:
-            i += 1; continue
-        entrada = float(row["Close"]); atr = float(row["ATR"])
-        stop, alvo = calcular_plano(sinal_bt, entrada, atr)
-        saida = None; motivo = None; j = i + 1
-        while j < len(d):
-            h, l = float(d.iloc[j]["High"]), float(d.iloc[j]["Low"])
-            if sinal_bt == "COMPRA":
-                if l <= stop and h >= alvo:
-                    saida, motivo = stop, "STOP (conservador em candle com ambos)"; break
-                if l <= stop:
-                    saida, motivo = stop, "STOP"; break
-                if h >= alvo:
-                    saida, motivo = alvo, "ALVO"; break
-            else:
-                if h >= stop and l <= alvo:
-                    saida, motivo = stop, "STOP (conservador em candle com ambos)"; break
-                if h >= stop:
-                    saida, motivo = stop, "STOP"; break
-                if l <= alvo:
-                    saida, motivo = alvo, "ALVO"; break
-            j += 1
-        if saida is not None:
-            pnl = ((saida/entrada)-1)*100 if sinal_bt == "COMPRA" else ((entrada/saida)-1)*100
-            resultados.append({"Estratégia":strategy_code,"Entrada":d.iloc[i]["close_time"],"Saída":d.iloc[j]["close_time"],"Lado":sinal_bt,"Entrada preço":entrada,"Stop":stop,"Alvo":alvo,"P&L %":pnl,"Saída por":motivo})
-            i = j + 1
-        else:
-            i += 1
-    return pd.DataFrame(resultados)
-
-
-def resumo_backtest(bt, valor_entrada=100.0):
-    if bt.empty:
-        return {"Operações":0,"WR %":0.0,"Lucro R$":0.0,"ROI %":0.0,"Drawdown máx. %":0.0}
-    wins = bt["P&L %"] > 0
-    lucro = float((bt["P&L %"] / 100.0 * valor_entrada).sum())
-    curva = (bt["P&L %"] / 100.0 * valor_entrada).cumsum()
-    pico = curva.cummax()
-    dd = (curva - pico)
-    return {"Operações":len(bt),"WR %":float(wins.mean()*100),"Lucro R$":lucro,"ROI %":float(lucro/(len(bt)*valor_entrada)*100),"Drawdown máx. R$":float(dd.min())}
-
 # ============================================================
 # INTERFACE
 # ============================================================
@@ -1399,16 +1526,17 @@ with st.sidebar:
             "C — Rompimento Donchian + Volume",
             "D — GEX + OI ATM + Expiração + Dual",
             "E — Brent/WTI + Sinal BTC",
+            "F — GEX Walls / First Touch",
         ],
         key="cfg_estrategia",
         on_change=salvar_configuracoes,
-        help="A = score técnico original; B = reversão à média; C = rompimento/momentum; D = GEX/OI/expiração; E = Brent/WTI como filtro.",
+        help="A = score técnico; B = reversão; C = rompimento; D = GEX/OI/expiração; E = Brent/WTI; F = GEX Walls com primeiro toque do dia.",
     )
     automatizar_todas = st.checkbox(
-        "🤖 Automatizar as 5 estratégias",
+        "🤖 Automatizar as 6 estratégias",
         key="cfg_automatizar_todas",
         on_change=salvar_configuracoes,
-        help="Quando ativado, A, B, C, D e E são avaliadas a cada candle. A estratégia selecionada acima serve apenas para detalhar o painel.",
+        help="Quando ativado, A, B, C, D, E e F são avaliadas a cada candle. A estratégia selecionada acima serve apenas para detalhar o painel.",
     )
     if automatizar_todas:
         st.success("🤖 A + B + C + D + E estão operando automaticamente")
@@ -1503,6 +1631,10 @@ def monitor():
         else:
             sinal_e, motivo_e_status = sinal, ""
 
+        f_walls = calcular_gex_walls(opcoes, preco_atual) if 'opcoes' in locals() and opcoes else None
+        f_estado = f_criar_snapshot(f_walls) if f_walls else f_buscar_estado()
+        sinal_f, motivo_f, fatores_f_compra, fatores_f_venda = estrategia_f_signal(row, f_estado)
+
         if estrategia.startswith("B"):
             strategy_code = "B"
         elif estrategia.startswith("C"):
@@ -1511,6 +1643,8 @@ def monitor():
             strategy_code = "D"
         elif estrategia.startswith("E"):
             strategy_code = "E"
+        elif estrategia.startswith("F"):
+            strategy_code = "F"
         else:
             strategy_code = "A"
         ciclo_criado = None
@@ -1525,7 +1659,7 @@ def monitor():
         # Quando automatizar_todas=True, cada estratégia é avaliada no mesmo
         # candle. O limite de operações abertas continua global e a proteção
         # entrada_ja_registrada impede duplicações a cada refresh.
-        estrategias_para_executar = ["A", "B", "C", "D", "E"] if automatizar_todas else [strategy_code]
+        estrategias_para_executar = ["A", "B", "C", "D", "E", "F"] if automatizar_todas else [strategy_code]
 
         sinais_estrategias = {
             "A": sinal,
@@ -1533,6 +1667,7 @@ def monitor():
             "C": estrategia_c_signal(row)[0],
             "D": "DUAL" if bool(gex_data and gex_data.get("d_ativa")) else "AGUARDAR",
             "E": sinal_e,
+            "F": sinal_f,
         }
 
         # A — score técnico original
@@ -1651,6 +1786,40 @@ def monitor():
             elif ratio_erro and "E" in estrategias_para_executar:
                 st.warning(f"Estratégia E indisponível: {ratio_erro}")
 
+        # F — GEX Walls / primeiro toque do dia
+        if "F" in estrategias_para_executar:
+            if sinal_f == "BLOQUEAR":
+                # Um candle que toca as duas paredes não oferece um primeiro toque inequívoco.
+                f_marcar_primeiro_toque("AMBIGUO", signal_time)
+            elif sinal_f in ("COMPRA", "VENDA") and quantidade_abertas < int(max_operacoes):
+                if not entrada_ja_registrada(signal_time, strategy="F", side=sinal_f):
+                    atr = float(row["ATR"])
+                    if np.isfinite(atr) and atr > 0:
+                        entrada = float(preco_atual)
+                        stop, alvo = calcular_plano(sinal_f, entrada, atr)
+                        motivo_f_entrada = motivo_f + " | " + " | ".join(fatores_f_compra if sinal_f == "COMPRA" else fatores_f_venda)
+                        trade_id = registrar_trade(
+                            side=sinal_f, entry_price=entrada, stop_price=stop, target_price=alvo,
+                            score=100.0, regime=regime, signal_time=signal_time, row=row,
+                            imbalance=orderbook["imbalance"], score_compra=100.0 if sinal_f == "COMPRA" else 0.0,
+                            score_venda=100.0 if sinal_f == "VENDA" else 0.0, signal=sinal_f,
+                            entry_reason=motivo_f_entrada, strategy="F", cycle_id=None,
+                            gex_data=gex_data, ratio_data=ratio_data,
+                            notes="Estratégia F — Sniper A Seco: entrada exclusivamente no primeiro toque diário de uma GEX Wall. Stop/alvo operacional seguem o plano ATR 1:2 do robô.",
+                        )
+                        f_marcar_primeiro_toque("PUT WALL" if sinal_f == "COMPRA" else "CALL WALL", signal_time)
+                        entradas_realizadas.append(f"#{trade_id} F {sinal_f}")
+                        quantidade_abertas += 1
+            elif sinal_f == "AGUARDAR" and f_estado and int(f_estado.get("first_touch_done") or 0) == 0:
+                # Se a vela tocou uma parede mas não confirmou, a própria função F
+                # informa isso; nesse caso o primeiro toque também deve consumir o dia.
+                low = float(row["Low"]); high = float(row["High"])
+                put_wall = float(f_estado["put_wall"]); call_wall = float(f_estado["call_wall"])
+                if low <= put_wall <= high and not (low <= call_wall <= high):
+                    f_marcar_primeiro_toque("PUT WALL", signal_time)
+                elif low <= call_wall <= high and not (low <= put_wall <= high):
+                    f_marcar_primeiro_toque("CALL WALL", signal_time)
+
         if entradas_realizadas:
             st.success("Nova entrada: " + " | ".join(entradas_realizadas))
 
@@ -1663,6 +1832,8 @@ def monitor():
             sinal_operacional = sinais_estrategias["D"]
         elif strategy_code == "E":
             sinal_operacional = sinais_estrategias["E"]
+        elif strategy_code == "F":
+            sinal_operacional = sinais_estrategias["F"]
         else:
             sinal_operacional = sinais_estrategias["A"]
 
@@ -1679,20 +1850,22 @@ def monitor():
                 {"Estratégia": "C — Rompimento", "Sinal": sinais_estrategias["C"]},
                 {"Estratégia": "D — GEX/Dual", "Sinal": sinais_estrategias["D"]},
                 {"Estratégia": "E — Brent/WTI", "Sinal": sinais_estrategias["E"]},
+                {"Estratégia": "F — GEX Walls", "Sinal": sinais_estrategias["F"]},
             ])
-            st.subheader("🤖 Automação — 5 estratégias")
+            st.subheader("🤖 Automação — 6 estratégias")
             st.dataframe(df_sinais, use_container_width=True, hide_index=True)
             st.caption(f"Execução automática ativa. Limite global: {quantidade_abertas}/{int(max_operacoes)} operações abertas.")
 
         # ========================================================
         # PAINEL
         # ========================================================
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("BTC", f"${preco_atual:,.2f}")
         c2.metric("Sinal operacional", sinal_operacional)
         c3.metric("Score COMPRA", f"{score_compra:.0f}")
         c4.metric("Score VENDA", f"{score_venda:.0f}")
         c5.metric("Regime", regime)
+        c6.metric("F", "Primeiro toque" if f_estado and not int(f_estado.get("first_touch_done") or 0) else "Consumido")
 
         # ========================================================
         # GRÁFICO DE CANDLES
@@ -1760,6 +1933,13 @@ def monitor():
                 st.write(f"**Sinal C:** {sinal_c_view}")
                 st.caption(motivo_c_view)
                 st.write(f"**Donchian H:** ${float(row['DONCHIAN_HIGH']):,.2f} | **Donchian L:** ${float(row['DONCHIAN_LOW']):,.2f}")
+            elif strategy_code == "F":
+                st.write(f"**Sinal F:** {sinal_f}")
+                st.caption(motivo_f)
+                if f_estado:
+                    st.write(f"**Put Wall:** ${float(f_estado['put_wall']):,.2f} | **Call Wall:** ${float(f_estado['call_wall']):,.2f}")
+                    st.write(f"**Gamma Flip:** ${float(f_estado['gamma_flip']):,.2f} | **Pin:** ${float(f_estado['pin_candidate']):,.2f}")
+                    st.write(f"**Centróide GEX:** ${float(f_estado['gamma_centroid']):,.2f} | **Primeiro toque:** {f_estado.get('first_touch_wall') or 'aguardando'}")
             sinal_plano = sinal_operacional if sinal_operacional in ("COMPRA", "VENDA") else (sinal if sinal in ("COMPRA", "VENDA") else None)
             if sinal_plano:
                 stop_view, alvo_view = calcular_plano(sinal_plano, preco_atual, float(row["ATR"]))
@@ -1780,6 +1960,13 @@ def monitor():
                 g3.metric("DTE", f"{gex_data['dte_hours']:.1f}h")
                 st.write(f"**Próxima expiração:** {gex_data['nearest_expiry']}")
                 st.write(f"**OI ATM ratio:** {gex_data['atm_oi_ratio']:.2%}")
+                if f_estado:
+                    st.markdown("**F — GEX Walls / First Touch**")
+                    fw1, fw2, fw3 = st.columns(3)
+                    fw1.metric("Put Wall", f"${float(f_estado['put_wall']):,.0f}")
+                    fw2.metric("Call Wall", f"${float(f_estado['call_wall']):,.0f}")
+                    fw3.metric("Gamma Flip", f"${float(f_estado['gamma_flip']):,.0f}")
+                    st.caption(f"Pin ${float(f_estado['pin_candidate']):,.0f} • Centr. ${float(f_estado['gamma_centroid']):,.0f} • Primeiro toque: {f_estado.get('first_touch_wall') or 'aguardando'}")
                 st.write(f"**Percentil usado para OI elevado:** {D_ATM_ELEVATED_PERCENTILE:.0f}%")
                 st.write(f"**Opções utilizadas:** {gex_data.get('options_used', '-')} | **Método:** {gex_data.get('gex_method', '-')}")
                 st.write("**Condições:** " + " | ".join(gex_data["condicoes"]))
@@ -1875,6 +2062,18 @@ def monitor():
                     "brent_wti_condition": ratio_data["condition"],
                     "strategy_e_signal": sinal_e,
                 })
+            if f_estado:
+                audit.update({
+                    "f_operational_date": f_estado.get("operational_date"),
+                    "f_call_wall": f_estado.get("call_wall"),
+                    "f_put_wall": f_estado.get("put_wall"),
+                    "f_gamma_flip": f_estado.get("gamma_flip"),
+                    "f_pin_candidate": f_estado.get("pin_candidate"),
+                    "f_gamma_centroid": f_estado.get("gamma_centroid"),
+                    "f_first_touch_done": f_estado.get("first_touch_done"),
+                    "f_first_touch_wall": f_estado.get("first_touch_wall"),
+                    "strategy_f_signal": sinal_f,
+                })
             st.dataframe(pd.DataFrame(list(audit.items()), columns=["Indicador", "Valor"]), use_container_width=True, hide_index=True)
 
         # ========================================================
@@ -1897,28 +2096,31 @@ def monitor():
             cols = ["#", "Estratégia", "Ciclo", "Lado", "Entrada", "Preço entrada", "Stop", "Alvo", "Saída", "Preço saída", "P&L %", "Resultado", "Saída por", "Score", "Regime"]
             st.dataframe(hist[cols], use_container_width=True, hide_index=True)
 
-            st.markdown("### 🧪 Backtest — meta de 1.000 operações por estratégia")
-            st.caption("O backtest histórico completo é calculado com dados públicos de candles. B e C podem ser testadas diretamente; D/GEX e E/Brent-WTI exigem histórico próprio dos dados externos para uma reprodução 100% fiel.")
-            if st.button("🚀 Executar backtest B + C", key="btn_backtest_bc"):
-                try:
-                    with st.spinner("Baixando histórico e simulando até 1.000 operações por método..."):
-                        hist_bt = buscar_klines_historico(50000)
-                        bt_b = backtest_bc(hist_bt, "B", 1000)
-                        bt_c = backtest_bc(hist_bt, "C", 1000)
-                    rows = []
-                    for code, bt in [("B", bt_b), ("C", bt_c)]:
-                        r = resumo_backtest(bt, valor_entrada)
-                        r["Estratégia"] = code
-                        rows.append(r)
-                        st.session_state[f"bt_{code}"] = bt
-                    st.session_state["bt_resumo"] = pd.DataFrame(rows)[["Estratégia","Operações","WR %","Lucro R$","ROI %","Drawdown máx. R$"]]
-                except Exception as exc:
-                    st.error(f"Backtest não executado: {exc}")
-            if "bt_resumo" in st.session_state:
-                st.dataframe(st.session_state["bt_resumo"], use_container_width=True, hide_index=True)
-                st.info("Para D e E, não vou inventar 1.000 operações: precisamos armazenar o histórico de GEX/OI e Brent/WTI para testar exatamente as regras dessas duas estratégias.")
+            st.markdown("### 💰 Banca por método — início de R$ 1.000")
+            st.caption("Cada método é simulado separadamente usando somente as operações paper fechadas daquela estratégia. Não é backtest histórico.")
+            metodos = [
+                ("A", "A — Atual"), ("B", "B — Reversão"), ("C", "C — Rompimento"),
+                ("D", "D — GEX/Dual"), ("E", "E — Brent/WTI"), ("F", "F — GEX Walls"),
+            ]
+            cards = []
+            historico_banca = buscar_historico(100000)
+            hist_fechado = historico_banca[historico_banca["pnl_pct"].notna()].copy() if not historico_banca.empty else pd.DataFrame()
+            for code, nome_metodo in metodos:
+                if hist_fechado.empty:
+                    sub = hist_fechado
+                else:
+                    sub = hist_fechado[hist_fechado["strategy"].fillna("A") == code].copy()
+                _, final_metodo = simular_banca(sub, 1000.0, valor_entrada)
+                operacoes_metodo = len(sub)
+                lucro_metodo = final_metodo - 1000.0
+                cards.append((nome_metodo, final_metodo, lucro_metodo, operacoes_metodo))
+            cols_cards = st.columns(3)
+            for idx, (nome_metodo, final_metodo, lucro_metodo, operacoes_metodo) in enumerate(cards):
+                with cols_cards[idx % 3]:
+                    st.metric(nome_metodo, f"R$ {final_metodo:,.2f}", f"{lucro_metodo:+,.2f} R$")
+                    st.caption(f"Início R$ 1.000,00 • {operacoes_metodo} operações fechadas")
 
-            st.markdown("### 💰 Simulação da banca")
+            st.markdown("### 💰 Simulação da banca geral")
             sim, banca_final = simular_banca(historico, banca_inicial, valor_entrada)
             st.caption(
                 f"Banca inicial: R$ {banca_inicial:,.2f} • Entrada fixa: R$ {valor_entrada:,.2f} por operação • "
