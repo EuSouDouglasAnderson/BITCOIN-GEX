@@ -5,6 +5,7 @@ import uuid
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -204,7 +205,7 @@ def salvar_configuracoes():
         "max_operacoes": int(st.session_state.get("cfg_max_operacoes", 5)),
         "tempo_maximo": int(st.session_state.get("cfg_tempo_maximo", 60)),
         "banca_inicial": float(st.session_state.get("cfg_banca_inicial", 1000.0)),
-        "percentual_entrada": float(st.session_state.get("cfg_percentual_entrada", 1.0)),
+        "valor_entrada": float(st.session_state.get("cfg_valor_entrada", 100.0)),
         "automatizar_todas": bool(st.session_state.get("cfg_automatizar_todas", True)),
     }
     conn = get_conn()
@@ -247,7 +248,10 @@ def inicializar_configuracoes_session():
     st.session_state["cfg_max_operacoes"] = int(salvas.get("max_operacoes", 5))
     st.session_state["cfg_tempo_maximo"] = int(salvas.get("tempo_maximo", 60))
     st.session_state["cfg_banca_inicial"] = float(salvas.get("banca_inicial", 1000.0))
-    st.session_state["cfg_percentual_entrada"] = float(salvas.get("percentual_entrada", 1.0))
+    st.session_state["cfg_valor_entrada"] = float(salvas.get("valor_entrada", 100.0))
+    # Compatibilidade com versões anteriores que salvavam percentual
+    if "valor_entrada" not in salvas and "percentual_entrada" in salvas:
+        st.session_state["cfg_valor_entrada"] = 100.0
     st.session_state["cfg_automatizar_todas"] = str(salvas.get("automatizar_todas", "True")).lower() in ("1", "true", "sim", "yes")
     st.session_state["_configs_carregadas"] = True
 
@@ -255,7 +259,7 @@ def inicializar_configuracoes_session():
     st.session_state["cfg_max_operacoes"] = min(50, max(1, st.session_state["cfg_max_operacoes"]))
     st.session_state["cfg_tempo_maximo"] = min(1440, max(5, st.session_state["cfg_tempo_maximo"]))
     st.session_state["cfg_banca_inicial"] = max(1.0, st.session_state["cfg_banca_inicial"])
-    st.session_state["cfg_percentual_entrada"] = min(100.0, max(0.1, st.session_state["cfg_percentual_entrada"]))
+    st.session_state["cfg_valor_entrada"] = max(1.0, float(st.session_state["cfg_valor_entrada"]))
 
 
 criar_banco()
@@ -1223,7 +1227,7 @@ def calcular_plano(side, preco, atr):
 # ============================================================
 # SIMULAÇÃO DA BANCA
 # ============================================================
-def simular_banca(historico, banca_inicial, percentual_entrada):
+def simular_banca(historico, banca_inicial, valor_entrada):
     if historico.empty:
         return pd.DataFrame(), float(banca_inicial)
     df = historico[historico["pnl_pct"].notna()].copy()
@@ -1233,14 +1237,14 @@ def simular_banca(historico, banca_inicial, percentual_entrada):
     df["entry_time_sort"] = pd.to_datetime(df["entry_time"], errors="coerce")
     df = df.sort_values(["entry_time_sort", "id"]).reset_index(drop=True)
     banca = float(banca_inicial)
-    taxa = float(percentual_entrada) / 100.0
+    valor_fixo = float(valor_entrada)
     registros = []
 
     for _, trade in df.iterrows():
         banca_antes = banca
-        valor_entrada = banca_antes * taxa
+        valor_op = min(valor_fixo, banca_antes)
         pnl_pct = float(trade["pnl_pct"])
-        resultado_rs = valor_entrada * (pnl_pct / 100.0)
+        resultado_rs = valor_op * (pnl_pct / 100.0)
         banca += resultado_rs
         registros.append(
             {
@@ -1252,8 +1256,7 @@ def simular_banca(historico, banca_inicial, percentual_entrada):
                 "Saída": trade["exit_time"],
                 "P&L mercado %": pnl_pct,
                 "Banca antes": banca_antes,
-                "Entrada %": percentual_entrada,
-                "Valor entrada": valor_entrada,
+                "Valor entrada": valor_op,
                 "Resultado R$": resultado_rs,
                 "Banca depois": banca,
                 "Resultado": trade["result"] if pd.notna(trade["result"]) else "-",
@@ -1261,6 +1264,114 @@ def simular_banca(historico, banca_inicial, percentual_entrada):
             }
         )
     return pd.DataFrame(registros), banca
+
+
+# ============================================================
+# GRÁFICO DE CANDLES
+# ============================================================
+def criar_grafico_candles(df, janela=100):
+    d = df.tail(janela).copy()
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=d["close_time"], open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
+        name="BTC/USDT"
+    ))
+    for col, nome in [("EMA20", "EMA20"), ("EMA50", "EMA50"), ("EMA200", "EMA200"), ("VWAP", "VWAP")]:
+        if col in d.columns:
+            fig.add_trace(go.Scatter(x=d["close_time"], y=d[col], mode="lines", name=nome))
+    if "BB_UPPER" in d.columns:
+        fig.add_trace(go.Scatter(x=d["close_time"], y=d["BB_UPPER"], mode="lines", name="BB superior", line=dict(dash="dot")))
+        fig.add_trace(go.Scatter(x=d["close_time"], y=d["BB_LOWER"], mode="lines", name="BB inferior", line=dict(dash="dot")))
+    if "DONCHIAN_HIGH" in d.columns:
+        fig.add_trace(go.Scatter(x=d["close_time"], y=d["DONCHIAN_HIGH"], mode="lines", name="Donchian alta", line=dict(dash="dash")))
+        fig.add_trace(go.Scatter(x=d["close_time"], y=d["DONCHIAN_LOW"], mode="lines", name="Donchian baixa", line=dict(dash="dash")))
+    fig.update_layout(height=560, margin=dict(l=10,r=10,t=35,b=10), xaxis_rangeslider_visible=False,
+                      title="BTC/USDT — candles de 5 minutos")
+    return fig
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def buscar_klines_historico(limite_total=50000):
+    """Busca histórico de 5m em páginas. Usado somente no backtest."""
+    cols = ["open_time","Open","High","Low","Close","Volume","close_time","quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"]
+    todos = []
+    end_time = None
+    restante = int(limite_total)
+    while restante > 0:
+        n = min(1000, restante)
+        params = {"symbol": SYMBOL, "interval": INTERVAL, "limit": n}
+        if end_time is not None:
+            params["endTime"] = end_time
+        r = requests.get(f"{BINANCE_API}/api/v3/klines", params=params, timeout=15)
+        r.raise_for_status()
+        lote = r.json()
+        if not lote:
+            break
+        todos = lote + todos
+        restante -= len(lote)
+        first_open = int(lote[0][0])
+        end_time = first_open - 1
+        if len(lote) < n:
+            break
+    df = pd.DataFrame(todos, columns=cols).drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
+    for col in ["Open","High","Low","Close","Volume","quote_volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+    return df
+
+
+def backtest_bc(df, strategy_code, max_trades=1000):
+    """Backtest objetivo de B/C com stop 1 ATR e alvo 2 ATR. Sem look-ahead no Donchian."""
+    d = calcular_indicadores(df.copy()).reset_index(drop=True)
+    resultados = []
+    i = 0
+    while i < len(d) - 2 and len(resultados) < max_trades:
+        row = d.iloc[i]
+        if strategy_code == "B":
+            sinal_bt, _ = estrategia_b_signal(row)
+        else:
+            sinal_bt, _ = estrategia_c_signal(row)
+        if sinal_bt not in ("COMPRA", "VENDA") or not np.isfinite(row.get("ATR", np.nan)) or row["ATR"] <= 0:
+            i += 1; continue
+        entrada = float(row["Close"]); atr = float(row["ATR"])
+        stop, alvo = calcular_plano(sinal_bt, entrada, atr)
+        saida = None; motivo = None; j = i + 1
+        while j < len(d):
+            h, l = float(d.iloc[j]["High"]), float(d.iloc[j]["Low"])
+            if sinal_bt == "COMPRA":
+                if l <= stop and h >= alvo:
+                    saida, motivo = stop, "STOP (conservador em candle com ambos)"; break
+                if l <= stop:
+                    saida, motivo = stop, "STOP"; break
+                if h >= alvo:
+                    saida, motivo = alvo, "ALVO"; break
+            else:
+                if h >= stop and l <= alvo:
+                    saida, motivo = stop, "STOP (conservador em candle com ambos)"; break
+                if h >= stop:
+                    saida, motivo = stop, "STOP"; break
+                if l <= alvo:
+                    saida, motivo = alvo, "ALVO"; break
+            j += 1
+        if saida is not None:
+            pnl = ((saida/entrada)-1)*100 if sinal_bt == "COMPRA" else ((entrada/saida)-1)*100
+            resultados.append({"Estratégia":strategy_code,"Entrada":d.iloc[i]["close_time"],"Saída":d.iloc[j]["close_time"],"Lado":sinal_bt,"Entrada preço":entrada,"Stop":stop,"Alvo":alvo,"P&L %":pnl,"Saída por":motivo})
+            i = j + 1
+        else:
+            i += 1
+    return pd.DataFrame(resultados)
+
+
+def resumo_backtest(bt, valor_entrada=100.0):
+    if bt.empty:
+        return {"Operações":0,"WR %":0.0,"Lucro R$":0.0,"ROI %":0.0,"Drawdown máx. %":0.0}
+    wins = bt["P&L %"] > 0
+    lucro = float((bt["P&L %"] / 100.0 * valor_entrada).sum())
+    curva = (bt["P&L %"] / 100.0 * valor_entrada).cumsum()
+    pico = curva.cummax()
+    dd = (curva - pico)
+    return {"Operações":len(bt),"WR %":float(wins.mean()*100),"Lucro R$":lucro,"ROI %":float(lucro/(len(bt)*valor_entrada)*100),"Drawdown máx. R$":float(dd.min())}
 
 # ============================================================
 # INTERFACE
@@ -1315,11 +1426,12 @@ with st.sidebar:
         key="cfg_banca_inicial",
         on_change=salvar_configuracoes,
     )
-    percentual_entrada = st.number_input(
-        "Entrada por operação (% da banca)",
-        min_value=0.1, max_value=100.0, step=0.1,
-        key="cfg_percentual_entrada",
+    valor_entrada = st.number_input(
+        "Valor por operação (R$)",
+        min_value=1.0, max_value=100000.0, step=10.0,
+        key="cfg_valor_entrada",
         on_change=salvar_configuracoes,
+        help="Valor nominal usado no paper trading e na simulação da banca. Padrão: R$ 100,00.",
     )
     st.divider()
     st.write(f"**Stop:** {ATR_STOP_MULTIPLIER:.1f} × ATR")
@@ -1601,10 +1713,16 @@ def monitor():
                 st.write(f"**Sinal C:** {sinal_c_view}")
                 st.caption(motivo_c_view)
                 st.write(f"**Donchian H:** ${float(row['DONCHIAN_HIGH']):,.2f} | **Donchian L:** ${float(row['DONCHIAN_LOW']):,.2f}")
-            if sinal in ("COMPRA", "VENDA"):
-                stop_view, alvo_view = calcular_plano(sinal, preco_atual, float(row["ATR"]))
-                st.write(f"**Stop técnico:** ${stop_view:,.2f}")
-                st.write(f"**Alvo técnico:** ${alvo_view:,.2f}")
+            sinal_plano = sinal_operacional if sinal_operacional in ("COMPRA", "VENDA") else (sinal if sinal in ("COMPRA", "VENDA") else None)
+            if sinal_plano:
+                stop_view, alvo_view = calcular_plano(sinal_plano, preco_atual, float(row["ATR"]))
+                risco_pct = abs((stop_view / preco_atual) - 1.0) * 100.0
+                alvo_pct = abs((alvo_view / preco_atual) - 1.0) * 100.0
+                risco_rs = float(valor_entrada) * risco_pct / 100.0
+                alvo_rs = float(valor_entrada) * alvo_pct / 100.0
+                st.write(f"**Plano {sinal_plano}:** Entrada ${preco_atual:,.2f} | Stop ${stop_view:,.2f} | Alvo ${alvo_view:,.2f}")
+                st.write(f"**Risco:** -{risco_pct:.3f}% ≈ -R$ {risco_rs:,.2f} | **Alvo:** +{alvo_pct:.3f}% ≈ +R$ {alvo_rs:,.2f} | **R/R:** 1:2")
+                st.caption(f"Valor nominal do paper trade: R$ {valor_entrada:,.2f}")
 
         with right:
             st.subheader("GEX / Opções Deribit")
@@ -1732,11 +1850,32 @@ def monitor():
             cols = ["#", "Estratégia", "Ciclo", "Lado", "Entrada", "Preço entrada", "Stop", "Alvo", "Saída", "Preço saída", "P&L %", "Resultado", "Saída por", "Score", "Regime"]
             st.dataframe(hist[cols], use_container_width=True, hide_index=True)
 
+            st.markdown("### 🧪 Backtest — meta de 1.000 operações por estratégia")
+            st.caption("O backtest histórico completo é calculado com dados públicos de candles. B e C podem ser testadas diretamente; D/GEX e E/Brent-WTI exigem histórico próprio dos dados externos para uma reprodução 100% fiel.")
+            if st.button("🚀 Executar backtest B + C", key="btn_backtest_bc"):
+                try:
+                    with st.spinner("Baixando histórico e simulando até 1.000 operações por método..."):
+                        hist_bt = buscar_klines_historico(50000)
+                        bt_b = backtest_bc(hist_bt, "B", 1000)
+                        bt_c = backtest_bc(hist_bt, "C", 1000)
+                    rows = []
+                    for code, bt in [("B", bt_b), ("C", bt_c)]:
+                        r = resumo_backtest(bt, valor_entrada)
+                        r["Estratégia"] = code
+                        rows.append(r)
+                        st.session_state[f"bt_{code}"] = bt
+                    st.session_state["bt_resumo"] = pd.DataFrame(rows)[["Estratégia","Operações","WR %","Lucro R$","ROI %","Drawdown máx. R$"]]
+                except Exception as exc:
+                    st.error(f"Backtest não executado: {exc}")
+            if "bt_resumo" in st.session_state:
+                st.dataframe(st.session_state["bt_resumo"], use_container_width=True, hide_index=True)
+                st.info("Para D e E, não vou inventar 1.000 operações: precisamos armazenar o histórico de GEX/OI e Brent/WTI para testar exatamente as regras dessas duas estratégias.")
+
             st.markdown("### 💰 Simulação da banca")
-            sim, banca_final = simular_banca(historico, banca_inicial, percentual_entrada)
+            sim, banca_final = simular_banca(historico, banca_inicial, valor_entrada)
             st.caption(
-                f"Banca inicial: R$ {banca_inicial:,.2f} • Entrada: {percentual_entrada:.1f}% por operação • "
-                "Na D, COMPRA e VENDA são duas operações e cada uma usa o percentual definido."
+                f"Banca inicial: R$ {banca_inicial:,.2f} • Entrada fixa: R$ {valor_entrada:,.2f} por operação • "
+                f"Na D, COMPRA e VENDA são duas operações e cada uma usa R$ {valor_entrada:,.2f}."
             )
             if sim.empty:
                 st.info("A simulação aparecerá após a primeira operação fechada.")
