@@ -923,7 +923,6 @@ def calcular_gex_proxy(opcoes, preco_btc):
     }
 
 # ============================================================
-
 # ESTRATÉGIA F — GEX WALLS / FIRST TOUCH
 # ============================================================
 def f_data_operacional():
@@ -935,39 +934,127 @@ def f_data_operacional():
     return data.isoformat(), agora_sp
 
 
+def f_buscar_estado():
+    """Busca o snapshot persistente do dia operacional atual."""
+    operational_date, _ = f_data_operacional()
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT operational_date, call_wall, put_wall, gamma_flip,
+                   pin_candidate, gamma_centroid, first_touch_done,
+                   first_touch_time, first_touch_wall, created_at
+            FROM f_day_state
+            WHERE operational_date = ?
+            """,
+            (operational_date,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return None
+
+    cols = [
+        "operational_date", "call_wall", "put_wall", "gamma_flip",
+        "pin_candidate", "gamma_centroid", "first_touch_done",
+        "first_touch_time", "first_touch_wall", "created_at",
+    ]
+    return dict(zip(cols, row))
+
+
+def f_criar_snapshot(walls):
+    """Cria o snapshot apenas uma vez por dia; nunca substitui walls já fixadas."""
+    if not walls:
+        return f_buscar_estado()
+
+    operational_date, agora_sp = f_data_operacional()
+    existente = f_buscar_estado()
+    if existente is not None:
+        return existente
+
+    put_wall = float(walls["put_wall"])
+    call_wall = float(walls["call_wall"])
+
+    if not np.isfinite(put_wall) or not np.isfinite(call_wall):
+        return None
+    if put_wall >= call_wall:
+        return None
+
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO f_day_state (
+                operational_date, call_wall, put_wall, gamma_flip,
+                pin_candidate, gamma_centroid, first_touch_done,
+                first_touch_time, first_touch_wall, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)
+            """,
+            (
+                operational_date,
+                call_wall,
+                put_wall,
+                float(walls.get("gamma_flip")) if walls.get("gamma_flip") is not None else None,
+                float(walls.get("pin_candidate")) if walls.get("pin_candidate") is not None else None,
+                float(walls.get("gamma_centroid")) if walls.get("gamma_centroid") is not None else None,
+                agora_sp.strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return f_buscar_estado()
+
+
+def f_marcar_primeiro_toque(wall_name, signal_time):
+    """Consome o primeiro toque do dia de forma atômica."""
+    operational_date, _ = f_data_operacional()
+    wall_name = str(wall_name)
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            UPDATE f_day_state
+            SET first_touch_done = 1,
+                first_touch_time = ?,
+                first_touch_wall = ?
+            WHERE operational_date = ?
+              AND COALESCE(first_touch_done, 0) = 0
+            """,
+            (str(signal_time), wall_name, operational_date),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def calcular_gex_walls(opcoes, preco_btc):
-    """Calcula Call Wall, Put Wall, Gamma Flip, Pin e centróide GEX.
+    """Calcula as GEX Walls para a estratégia F.
 
-    Proxy baseada em OI + mark_iv + gamma Black-Scholes.
+    Regras operacionais:
+      - Put Wall: maior put GEX em strike abaixo do spot.
+      - Call Wall: maior call GEX em strike acima do spot.
+      - Gamma Flip: ponto de mudança de sinal da soma acumulada do GEX.
+      - Pin: strike com maior OI.
+      - Centróide: média ponderada pelo módulo do GEX.
 
-    Regras dos Walls:
-      - Put Wall  = maior concentração de put GEX em strikes <= spot
-      - Call Wall = maior concentração de call GEX em strikes >= spot
-
-    Dessa forma, a estrutura operacional fica:
-
-        Put Wall <= Spot <= Call Wall
-
-    quando existem candidatos válidos dos dois lados.
-
-    A função usa as expirações até F_MAX_DTE_HOURS e concentra
-    a leitura em strikes próximos do spot.
+    O snapshot diário é tratado separadamente por f_criar_snapshot().
     """
     agora_utc = datetime.now(timezone.utc)
-    spot = float(preco_btc)
-
+    try:
+        spot = float(preco_btc)
+    except (TypeError, ValueError):
+        return None
     if not np.isfinite(spot) or spot <= 0:
         return None
 
     registros = []
-
-    # --------------------------------------------------------
-    # 1. CALCULA GEX INDIVIDUAL DAS OPÇÕES
-    # --------------------------------------------------------
-    for item in opcoes:
-        nome = item.get("instrument_name", "")
+    for item in opcoes or []:
+        nome = str(item.get("instrument_name", ""))
         tipo = str(item.get("option_type", "")).lower()
-
         if tipo not in ("call", "put"):
             if nome.endswith("-C"):
                 tipo = "call"
@@ -982,64 +1069,34 @@ def calcular_gex_walls(opcoes, preco_btc):
             exp_ms = float(item.get("expiration_timestamp"))
         except (TypeError, ValueError):
             continue
-
-        if (
-            not np.isfinite(strike)
-            or not np.isfinite(oi)
-            or oi <= 0
-            or not np.isfinite(exp_ms)
-        ):
+        if not all(np.isfinite([strike, oi, exp_ms])) or oi <= 0 or strike <= 0:
             continue
 
         try:
-            expiry = datetime.fromtimestamp(
-                exp_ms / 1000.0,
-                tz=timezone.utc
-            )
+            expiry = datetime.fromtimestamp(exp_ms / 1000.0, tz=timezone.utc)
         except Exception:
             continue
-
-        dte_hours = (
-            expiry - agora_utc
-        ).total_seconds() / 3600.0
-
+        dte_hours = (expiry - agora_utc).total_seconds() / 3600.0
         if dte_hours < -1 or dte_hours > F_MAX_DTE_HOURS:
             continue
 
         iv = _normalizar_iv(item.get("mark_iv"))
-
         if not np.isfinite(iv):
             continue
-
         gamma = _gamma_black_scholes(
-            spot,
-            strike,
-            iv,
-            max(dte_hours, 0.01) / (24.0 * 365.0)
+            spot, strike, iv, max(dte_hours, 0.01) / (24.0 * 365.0)
         )
-
         if not np.isfinite(gamma) or gamma <= 0:
             continue
 
         try:
-            contract_size = float(
-                item.get("contract_size", 1.0)
-            )
+            contract_size = float(item.get("contract_size", 1.0))
         except (TypeError, ValueError):
             contract_size = 1.0
-
         if not np.isfinite(contract_size) or contract_size <= 0:
             contract_size = 1.0
 
-        # Proxy de GEX
-        bruto = (
-            oi
-            * contract_size
-            * gamma
-            * (spot ** 2)
-            * 0.01
-        )
-
+        bruto = oi * contract_size * gamma * (spot ** 2) * 0.01
         registros.append({
             "type": tipo,
             "strike": strike,
@@ -1052,58 +1109,180 @@ def calcular_gex_walls(opcoes, preco_btc):
         return None
 
     d = pd.DataFrame(registros)
-
-    # --------------------------------------------------------
-    # 2. FILTRO ATM
-    # --------------------------------------------------------
-    d = d[
-        (d["strike"] / spot - 1).abs() <= F_ATM_BAND_PCT
-    ].copy()
-
+    d = d[(d["strike"] / spot - 1).abs() <= F_ATM_BAND_PCT].copy()
     if d.empty:
         return None
 
-    # --------------------------------------------------------
-    # 3. AGREGA GEX POR STRIKE
-    # --------------------------------------------------------
     por_strike = (
         d.groupby("strike", as_index=False)
         .agg(
             net_gex=("gex", "sum"),
-
-            # Apenas GEX positivo das Calls
-            call_gex=(
-                "gex",
-                lambda x: float(x[x > 0].sum())
-            ),
-
-            # Magnitude do GEX negativo das Puts
-            put_gex=(
-                "gex",
-                lambda x: float(abs(x[x < 0].sum()))
-            ),
-
+            call_gex=("gex", lambda x: float(x[x > 0].sum())),
+            put_gex=("gex", lambda x: float(abs(x[x < 0].sum()))),
             oi=("oi", "sum"),
         )
         .sort_values("strike")
         .reset_index(drop=True)
     )
-
     if por_strike.empty:
         return None
 
     # --------------------------------------------------------
-    # 4. PUT WALL
+    # WALLS: força a geometria Put < Spot < Call sempre que
+    # existirem strikes suficientes dos dois lados.
     # --------------------------------------------------------
-    # Put Wall precisa estar no lado de suporte:
-    # strike <= spot
-    #
-    # Primeiro tentamos encontrar o maior
+    distancia_min = max(0.0, float(F_MIN_WALL_DISTANCE_PCT))
+    put_preferidos = por_strike[
+        (por_strike["strike"] < spot * (1.0 - distancia_min))
+        & (por_strike["put_gex"] > 0)
+    ].copy()
+    call_preferidos = por_strike[
+        (por_strike["strike"] > spot * (1.0 + distancia_min))
+        & (por_strike["call_gex"] > 0)
+    ].copy()
 
+    # Fallback: se não houver distância mínima disponível, usa qualquer
+    # strike válido de cada lado do spot.
+    if put_preferidos.empty:
+        put_preferidos = por_strike[(por_strike["strike"] < spot) & (por_strike["put_gex"] > 0)].copy()
+    if call_preferidos.empty:
+        call_preferidos = por_strike[(por_strike["strike"] > spot) & (por_strike["call_gex"] > 0)].copy()
+
+    if put_preferidos.empty or call_preferidos.empty:
+        return None
+
+    put_row = put_preferidos.sort_values(["put_gex", "strike"], ascending=[False, False]).iloc[0]
+    call_row = call_preferidos.sort_values(["call_gex", "strike"], ascending=[False, True]).iloc[0]
+    put_wall = float(put_row["strike"])
+    call_wall = float(call_row["strike"])
+
+    if not (put_wall < spot < call_wall):
+        return None
+
+    # --------------------------------------------------------
+    # PIN: maior OI por strike dentro da janela.
+    # --------------------------------------------------------
+    pin_row = por_strike.sort_values(["oi", "strike"], ascending=[False, True]).iloc[0]
+    pin_candidate = float(pin_row["strike"])
+
+    # --------------------------------------------------------
+    # CENTRÓIDE GEX: ponderado pelo módulo do net GEX.
+    # --------------------------------------------------------
+    pesos = por_strike["net_gex"].abs().astype(float)
+    if float(pesos.sum()) > 0:
+        gamma_centroid = float((por_strike["strike"] * pesos).sum() / pesos.sum())
+    else:
+        gamma_centroid = float(spot)
+
+    # --------------------------------------------------------
+    # GAMMA FLIP: procura cruzamento do GEX acumulado.
+    # --------------------------------------------------------
+    acumulado = por_strike["net_gex"].cumsum().to_numpy(dtype=float)
+    strikes = por_strike["strike"].to_numpy(dtype=float)
+    gamma_flip = None
+    for i in range(1, len(acumulado)):
+        a = acumulado[i - 1]
+        b = acumulado[i]
+        if a == 0:
+            gamma_flip = strikes[i - 1]
+            break
+        if (a < 0 <= b) or (a > 0 >= b):
+            x1, x2 = strikes[i - 1], strikes[i]
+            if b != a:
+                gamma_flip = float(x1 + (0 - a) * (x2 - x1) / (b - a))
+            else:
+                gamma_flip = float(x1)
+            break
+    if gamma_flip is None:
+        gamma_flip = float(strikes[int(np.argmin(np.abs(acumulado)))])
+
+    return {
+        "spot": spot,
+        "put_wall": put_wall,
+        "call_wall": call_wall,
+        "gamma_flip": gamma_flip,
+        "pin_candidate": pin_candidate,
+        "gamma_centroid": gamma_centroid,
+        "walls_validos": bool(put_wall < spot < call_wall),
+        "put_distance_pct": (spot / put_wall - 1.0) * 100.0,
+        "call_distance_pct": (call_wall / spot - 1.0) * 100.0,
+        "walls_distance_pct": (call_wall - put_wall) / spot * 100.0,
+        "walls_spaced": bool(((call_wall - put_wall) / spot) >= 0.03),
+        "options_used": len(d),
+    }
+
+
+def estrategia_f_signal(row, f_estado):
+    """Sinal F: exclusivamente no primeiro toque diário de uma wall.
+
+    Put Wall tocada + fechamento de confirmação acima -> COMPRA.
+    Call Wall tocada + fechamento de confirmação abaixo -> VENDA.
+    As duas walls no mesmo candle -> BLOQUEAR.
+    O consumo persistente do primeiro toque é feito pelo monitor.
+    """
+    fatores_compra = []
+    fatores_venda = []
+
+    if not f_estado:
+        return "AGUARDAR", "F aguardando snapshot diário das GEX Walls.", fatores_compra, fatores_venda
+
+    if int(f_estado.get("first_touch_done") or 0) == 1:
+        wall = f_estado.get("first_touch_wall") or "desconhecida"
+        return "AGUARDAR", f"F bloqueada: primeiro toque do dia já consumido ({wall}).", fatores_compra, fatores_venda
+
+    try:
+        low = float(row["Low"])
+        high = float(row["High"])
+        close = float(row["Close"])
+        put_wall = float(f_estado["put_wall"])
+        call_wall = float(f_estado["call_wall"])
+    except (TypeError, ValueError, KeyError):
+        return "AGUARDAR", "F sem dados válidos de candle/walls.", fatores_compra, fatores_venda
+
+    toque_put = low <= put_wall <= high
+    toque_call = low <= call_wall <= high
+
+    if toque_put and toque_call:
+        return "BLOQUEAR", (
+            f"F BLOQUEAR | candle tocou Put Wall ${put_wall:,.0f} e Call Wall ${call_wall:,.0f} simultaneamente."
+        ), fatores_compra, fatores_venda
+
+    if toque_put:
+        fatores_compra.extend([
+            f"Primeiro toque Put Wall ${put_wall:,.0f}",
+            f"Fechamento ${close:,.0f} {'acima' if close >= put_wall else 'abaixo'} da Put Wall",
+        ])
+        if close >= put_wall:
+            return "COMPRA", (
+                f"F SNIPER A SECO | primeiro toque PUT WALL ${put_wall:,.0f} | "
+                f"close ${close:,.0f} confirmou acima da wall."
+            ), fatores_compra, fatores_venda
+        return "AGUARDAR", (
+            f"F primeiro toque PUT WALL ${put_wall:,.0f}, mas sem confirmação de fechamento acima."
+        ), fatores_compra, fatores_venda
+
+    if toque_call:
+        fatores_venda.extend([
+            f"Primeiro toque Call Wall ${call_wall:,.0f}",
+            f"Fechamento ${close:,.0f} {'abaixo' if close <= call_wall else 'acima'} da Call Wall",
+        ])
+        if close <= call_wall:
+            return "VENDA", (
+                f"F SNIPER A SECO | primeiro toque CALL WALL ${call_wall:,.0f} | "
+                f"close ${close:,.0f} confirmou abaixo da wall."
+            ), fatores_compra, fatores_venda
+        return "AGUARDAR", (
+            f"F primeiro toque CALL WALL ${call_wall:,.0f}, mas sem confirmação de fechamento abaixo."
+        ), fatores_compra, fatores_venda
+
+    return "AGUARDAR", (
+        f"F aguardando primeiro toque | Put ${put_wall:,.0f} | Call ${call_wall:,.0f} | Close ${close:,.0f}."
+    ), fatores_compra, fatores_venda
 
 
 # ============================================================
 # INDICADORES
+# ============================================================
 # ============================================================
 def calcular_indicadores(df):
     df = df.copy()
@@ -1537,7 +1716,7 @@ with st.sidebar:
         help="Quando ativado, A, B, C, D, E e F são avaliadas a cada candle. A estratégia selecionada acima serve apenas para detalhar o painel.",
     )
     if automatizar_todas:
-        st.success("🤖 A + B + C + D + E estão operando automaticamente")
+        st.success("🤖 A + B + C + D + E + F estão operando automaticamente")
     else:
         st.warning("Modo individual: somente a estratégia selecionada será executada")
 
@@ -1788,26 +1967,35 @@ def monitor():
         if "F" in estrategias_para_executar:
             if sinal_f == "BLOQUEAR":
                 # Um candle que toca as duas paredes não oferece um primeiro toque inequívoco.
+                # Mesmo assim, o dia fica consumido para impedir uma entrada posterior.
                 f_marcar_primeiro_toque("AMBIGUO", signal_time)
-            elif sinal_f in ("COMPRA", "VENDA") and quantidade_abertas < int(max_operacoes):
-                if not entrada_ja_registrada(signal_time, strategy="F", side=sinal_f):
-                    atr = float(row["ATR"])
-                    if np.isfinite(atr) and atr > 0:
-                        entrada = float(preco_atual)
-                        stop, alvo = calcular_plano(sinal_f, entrada, atr)
-                        motivo_f_entrada = motivo_f + " | " + " | ".join(fatores_f_compra if sinal_f == "COMPRA" else fatores_f_venda)
-                        trade_id = registrar_trade(
-                            side=sinal_f, entry_price=entrada, stop_price=stop, target_price=alvo,
-                            score=100.0, regime=regime, signal_time=signal_time, row=row,
-                            imbalance=orderbook["imbalance"], score_compra=100.0 if sinal_f == "COMPRA" else 0.0,
-                            score_venda=100.0 if sinal_f == "VENDA" else 0.0, signal=sinal_f,
-                            entry_reason=motivo_f_entrada, strategy="F", cycle_id=None,
-                            gex_data=gex_data, ratio_data=ratio_data,
-                            notes="Estratégia F — Sniper A Seco: entrada exclusivamente no primeiro toque diário de uma GEX Wall. Stop/alvo operacional seguem o plano ATR 1:2 do robô.",
-                        )
-                        f_marcar_primeiro_toque("PUT WALL" if sinal_f == "COMPRA" else "CALL WALL", signal_time)
-                        entradas_realizadas.append(f"#{trade_id} F {sinal_f}")
-                        quantidade_abertas += 1
+            elif sinal_f in ("COMPRA", "VENDA"):
+                # O primeiro toque é consumido independentemente do limite de
+                # operações. Assim, se o robô estiver lotado neste candle, ele
+                # não poderá entrar numa segunda visita à mesma wall.
+                wall_tocada = "PUT WALL" if sinal_f == "COMPRA" else "CALL WALL"
+                toque_consumido = f_marcar_primeiro_toque(wall_tocada, signal_time)
+
+                if toque_consumido and quantidade_abertas < int(max_operacoes):
+                    if not entrada_ja_registrada(signal_time, strategy="F", side=sinal_f):
+                        atr = float(row["ATR"])
+                        if np.isfinite(atr) and atr > 0:
+                            entrada = float(preco_atual)
+                            stop, alvo = calcular_plano(sinal_f, entrada, atr)
+                            motivo_f_entrada = motivo_f + " | " + " | ".join(fatores_f_compra if sinal_f == "COMPRA" else fatores_f_venda)
+                            trade_id = registrar_trade(
+                                side=sinal_f, entry_price=entrada, stop_price=stop, target_price=alvo,
+                                score=100.0, regime=regime, signal_time=signal_time, row=row,
+                                imbalance=orderbook["imbalance"], score_compra=100.0 if sinal_f == "COMPRA" else 0.0,
+                                score_venda=100.0 if sinal_f == "VENDA" else 0.0, signal=sinal_f,
+                                entry_reason=motivo_f_entrada, strategy="F", cycle_id=None,
+                                gex_data=gex_data, ratio_data=ratio_data,
+                                notes="Estratégia F — Sniper A Seco: entrada exclusivamente no primeiro toque diário de uma GEX Wall. Stop/alvo operacional seguem o plano ATR 1:2 do robô.",
+                            )
+                            entradas_realizadas.append(f"#{trade_id} F {sinal_f}")
+                            quantidade_abertas += 1
+                elif toque_consumido and quantidade_abertas >= int(max_operacoes):
+                    st.info("F: primeiro toque consumido, mas o limite de operações abertas foi atingido; nenhuma entrada F foi aberta.")
             elif sinal_f == "AGUARDAR" and f_estado and int(f_estado.get("first_touch_done") or 0) == 0:
                 # Se a vela tocou uma parede mas não confirmou, a própria função F
                 # informa isso; nesse caso o primeiro toque também deve consumir o dia.
