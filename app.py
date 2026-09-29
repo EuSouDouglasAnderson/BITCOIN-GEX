@@ -912,8 +912,15 @@ def calcular_indicadores(df):
     loss = -delta.clip(upper=0)
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
+    # RSI simétrico: quando não há perdas na janela, o RSI deve ser 100
+    # (e não NaN). Quando não há ganhos, deve ser 0. Isso evita que a
+    # Estratégia A/B ignore movimentos fortemente unidirecionais de alta.
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI"] = 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50.0)
+    df["RSI"] = rsi
 
     prev_close = df["Close"].shift(1)
     tr = pd.concat(
@@ -1128,12 +1135,12 @@ def gerar_score(row, imbalance):
         add_compra(10, "Retorno 48 candles > 0")
     else:
         add_venda(10, "Retorno 48 candles <= 0")
-    if 50 <= row["RSI"] <= 70:
-        add_compra(10, "RSI entre 50 e 70")
-    elif 30 <= row["RSI"] < 45:
-        add_venda(10, "RSI entre 30 e 45")
-    elif 45 <= row["RSI"] < 50:
-        add_venda(5, "RSI entre 45 e 50")
+    # RSI simétrico: evita viés estrutural para COMPRA.
+    # Acima de 55 favorece COMPRA; abaixo de 45 favorece VENDA.
+    if row["RSI"] >= 55:
+        add_compra(10, "RSI >= 55")
+    elif row["RSI"] <= 45:
+        add_venda(10, "RSI <= 45")
     if row["volume_z"] > 1 and row["ret_1"] > 0:
         add_compra(10, "Volume Z > 1 com retorno positivo")
     elif row["volume_z"] > 1 and row["ret_1"] < 0:
@@ -1329,9 +1336,9 @@ def backtest_bc(df, strategy_code, max_trades=1000):
     while i < len(d) - 2 and len(resultados) < max_trades:
         row = d.iloc[i]
         if strategy_code == "B":
-            sinal_bt, _ = estrategia_b_signal(row)
+            sinal_bt, *_ = estrategia_b_signal(row)
         else:
-            sinal_bt, _ = estrategia_c_signal(row)
+            sinal_bt, *_ = estrategia_c_signal(row)
         if sinal_bt not in ("COMPRA", "VENDA") or not np.isfinite(row.get("ATR", np.nan)) or row["ATR"] <= 0:
             i += 1; continue
         entrada = float(row["Close"]); atr = float(row["ATR"])
