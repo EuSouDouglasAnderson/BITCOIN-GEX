@@ -1291,27 +1291,33 @@ def estrategia_f_signal(row, f_estado):
 
 
 # ============================================================
-# ESTRATÉGIA G — GEX EXPANSION 0.50%
+# ESTRATÉGIA G — GEX EXPANSION 0.50% (versão corrigida)
 # ============================================================
+# Constantes opcionais (usam o valor abaixo se não estiverem definidas no seu módulo)
+G_FLIP_DIRECTIONAL = globals().get("G_FLIP_DIRECTIONAL", False)
+G_FEE_ROUND_TRIP_PCT = globals().get("G_FEE_ROUND_TRIP_PCT", 0.0010)  # 0,05% taker x 2 lados
+ 
+ 
 def estrategia_g_signal(row, gex_data, walls_data):
-    """GEX Expansion: procura movimento de pelo menos +/-0,50%.
-
-    Importante: 10x NÃO é usado para normalizar GEX, Walls ou Volume Z.
-    Os dados são convertidos para unidades relativas ao preço e comparados
-    com o evento-alvo de 0,50% no BTC.
-
-    LONG:
-      - GEX normalizado negativo (regime de expansão)
-      - spot acima do Gamma Flip
-      - Call Wall dentro de 0,50% do spot
-      - Volume Z >= 1
-
-    SHORT: espelho.
+    """GEX Expansion: procura movimento de pelo menos +/-0,50% no BTC.
+ 
+    10x é usado apenas como referência de ROE, nunca para normalizar
+    GEX, Walls ou Volume Z.
+ 
+    Condições de ativação (todas obrigatórias):
+      1. GEX normalizado < 0 (regime de expansão)
+      2. Spot a no máximo G_MAX_GAMMA_FLIP_DISTANCE_PCT do Gamma Flip
+         (se G_FLIP_DIRECTIONAL=True, exige também o lado: LONG acima, SHORT abaixo)
+      3. Wall do lado do trade (Call p/ LONG, Put p/ SHORT) entre 0 e
+         G_MAX_WALL_DISTANCE_PCT do spot
+      4. Volume Z >= G_MIN_VOLUME_Z
+      5. Score do lado >= G_MIN_SCORE e maior que o score do lado oposto
+ 
+    Score (0-100): GEX 25 + Flip 20 + Wall 20..30 + Volume 15 + bônus 10
+    (bônus quando a wall está além do alvo, ou seja, o caminho até o alvo
+    não é barrado por ela).
     """
     fatores_compra, fatores_venda = [], []
-    # GEX pode existir mesmo quando a rotina de Walls da F não encontrou
-    # uma geometria válida. Nesse caso, não zeramos o painel: mostramos o
-    # estado parcial e deixamos a G aguardando confirmação das Walls.
     if not gex_data:
         return "AGUARDAR", "G aguardando dados GEX da Deribit.", fatores_compra, fatores_venda, 0.0, 0.0, {
             "status": "SEM_GEX",
@@ -1323,7 +1329,7 @@ def estrategia_g_signal(row, gex_data, walls_data):
             "leverage_reference": 10.0,
             "roe_target_pct": G_TARGET_PCT * 100.0 * 10.0,
         }
-
+ 
     try:
         spot = float(row["Close"])
         volume_z = float(row["volume_z"])
@@ -1335,72 +1341,89 @@ def estrategia_g_signal(row, gex_data, walls_data):
         call_wall = float(walls_data["call_wall"])
     except (TypeError, ValueError, KeyError):
         return "AGUARDAR", "G sem dados válidos para normalização.", fatores_compra, fatores_venda, 0.0, 0.0, {}
-
-    if not all(np.isfinite([spot, volume_z, gex, gamma_flip, put_wall, call_wall])) or spot <= 0:
+ 
+    valores = [spot, volume_z, gex, gex_calls, gex_puts, gamma_flip, put_wall, call_wall]
+    if not all(np.isfinite(valores)) or spot <= 0 or gamma_flip <= 0 or put_wall <= 0 or call_wall <= 0:
         return "AGUARDAR", "G sem dados numéricos válidos.", fatores_compra, fatores_venda, 0.0, 0.0, {}
-
+ 
     total_abs = gex_calls + gex_puts
     gex_norm = float(np.clip(gex / total_abs, -1.0, 1.0)) if total_abs > 0 else 0.0
-    gamma_flip_dist = (spot / gamma_flip - 1.0) if gamma_flip > 0 else np.nan
+    gamma_flip_dist = spot / gamma_flip - 1.0
     put_dist = (spot - put_wall) / spot
     call_dist = (call_wall - spot) / spot
-
-    # Score direcional 0-100: GEX 25, Flip 20, Wall 30, Volume 15,
-    # proximidade adicional do alvo 0,50% 10.
+ 
     def score_lado(lado):
+        """Calcula todos os componentes (sem retorno antecipado).
+ 
+        Retorna (score, fatores, ativavel). 'ativavel' só é True se todas
+        as condições obrigatórias forem atendidas.
+        """
         score = 0.0
         fatores = []
-        if gex_norm < 0:
+        gates = []
+ 
+        # 1. GEX
+        gex_ok = gex_norm < 0
+        gates.append(gex_ok)
+        if gex_ok:
             score += 25.0
             fatores.append(f"GEX expansão normalizado {gex_norm:+.2f}")
         else:
-            # Mantém o score diagnóstico visível mesmo fora do regime de
-            # expansão. A G só pode ser ativada quando o GEX for negativo,
-            # mas os demais componentes continuam sendo calculados para que
-            # o painel mostre por que está aguardando.
             fatores.append(f"GEX não confirmou expansão ({gex_norm:+.2f})")
-
+ 
+        # 2. Gamma Flip
         if lado == "COMPRA":
-            flip_ok = gamma_flip_dist >= 0
-            wall_dist = call_dist
-            wall_nome = "Call Wall"
+            wall_dist, wall_nome = call_dist, "Call Wall"
+            lado_flip_ok = gamma_flip_dist >= 0
         else:
-            flip_ok = gamma_flip_dist <= 0
-            wall_dist = put_dist
-            wall_nome = "Put Wall"
-
+            wall_dist, wall_nome = put_dist, "Put Wall"
+            lado_flip_ok = gamma_flip_dist <= 0
+ 
+        perto_flip = abs(gamma_flip_dist) <= G_MAX_GAMMA_FLIP_DISTANCE_PCT
+        flip_ok = perto_flip and (lado_flip_ok if G_FLIP_DIRECTIONAL else True)
+        gates.append(flip_ok)
         if flip_ok:
-            flip_dist_abs = abs(gamma_flip_dist)
-            if flip_dist_abs <= G_MAX_GAMMA_FLIP_DISTANCE_PCT:
-                score += 20.0
-                fatores.append(f"Gamma Flip confirmado | distância {gamma_flip_dist:+.2%}")
-            else:
-                return score, fatores
+            score += 20.0
+            fatores.append(f"Gamma Flip confirmado | distância {gamma_flip_dist:+.2%}")
+        elif not perto_flip:
+            fatores.append(
+                f"Gamma Flip longe ({gamma_flip_dist:+.2%} > {G_MAX_GAMMA_FLIP_DISTANCE_PCT:.2%})"
+            )
         else:
-            return score, fatores
-
-        if 0 <= wall_dist <= G_MAX_WALL_DISTANCE_PCT:
+            fatores.append(f"Gamma Flip do lado errado para {lado} ({gamma_flip_dist:+.2%})")
+ 
+        # 3. Wall
+        wall_ok = 0 <= wall_dist <= G_MAX_WALL_DISTANCE_PCT
+        gates.append(wall_ok)
+        if wall_ok:
             proximity = max(0.0, 1.0 - wall_dist / G_MAX_WALL_DISTANCE_PCT)
             score += 20.0 + 10.0 * proximity
-            fatores.append(f"{wall_nome} a {wall_dist:+.2%} | alvo 0,50%")
+            fatores.append(f"{wall_nome} a {wall_dist:+.2%} | alvo {G_TARGET_PCT:.2%}")
         else:
-            return score, fatores
-
-        volume_score = 15.0 * min(max(volume_z - G_MIN_VOLUME_Z, 0.0) / 2.0 + 0.5, 1.0) if volume_z >= G_MIN_VOLUME_Z else 0.0
-        if volume_z >= G_MIN_VOLUME_Z:
-            score += volume_score
+            fatores.append(f"{wall_nome} fora da faixa ({wall_dist:+.2%})")
+ 
+        # 4. Volume
+        vol_ok = volume_z >= G_MIN_VOLUME_Z
+        gates.append(vol_ok)
+        if vol_ok:
+            score += 15.0 * min((volume_z - G_MIN_VOLUME_Z) / 2.0 + 0.5, 1.0)
             fatores.append(f"Volume Z {volume_z:+.2f}")
         else:
-            return score, fatores
-
-        # 10 pontos adicionais quando a wall está dentro do próprio alvo.
-        if wall_dist <= G_TARGET_PCT:
+            fatores.append(f"Volume Z fraco ({volume_z:+.2f} < {G_MIN_VOLUME_Z:.2f})")
+ 
+        # Bônus: wall além do alvo (não barra o movimento antes de 0,50%)
+        if wall_ok and wall_dist >= G_TARGET_PCT:
             score += 10.0
-        return min(score, 100.0), fatores
-
-    score_compra, fatores_compra = score_lado("COMPRA")
-    score_venda, fatores_venda = score_lado("VENDA")
-
+            fatores.append("Wall além do alvo (caminho livre)")
+ 
+        return min(score, 100.0), fatores, all(gates)
+ 
+    score_compra, fatores_compra, ok_compra = score_lado("COMPRA")
+    score_venda, fatores_venda, ok_venda = score_lado("VENDA")
+ 
+    roe_bruto = G_TARGET_PCT * 100.0 * 10.0
+    roe_liquido = (G_TARGET_PCT - G_FEE_ROUND_TRIP_PCT) * 100.0 * 10.0
+ 
     detalhes = {
         "gex_norm": gex_norm,
         "gamma_flip_dist_pct": gamma_flip_dist * 100.0,
@@ -1409,16 +1432,23 @@ def estrategia_g_signal(row, gex_data, walls_data):
         "target_pct": G_TARGET_PCT * 100.0,
         "volume_z": volume_z,
         "leverage_reference": 10.0,
-        "roe_target_pct": G_TARGET_PCT * 100.0 * 10.0,
+        "roe_target_pct": roe_bruto,
+        "roe_net_est_pct": roe_liquido,
     }
-
-    if score_compra >= G_MIN_SCORE and score_compra > score_venda and gex_norm < 0:
-        return "COMPRA", f"G ATIVA | score {score_compra:.0f} | alvo BTC +0,50% (~+5% ROE em 10x).", fatores_compra, fatores_venda, score_compra, score_venda, detalhes
-    if score_venda >= G_MIN_SCORE and score_venda > score_compra and gex_norm < 0:
-        return "VENDA", f"G ATIVA | score {score_venda:.0f} | alvo BTC -0,50% (~+5% ROE em 10x).", fatores_compra, fatores_venda, score_compra, score_venda, detalhes
-    return "AGUARDAR", f"G aguardando confirmação | compra {score_compra:.0f} | venda {score_venda:.0f} | mínimo {G_MIN_SCORE:.0f}.", fatores_compra, fatores_venda, score_compra, score_venda, detalhes
-
-
+ 
+    if ok_compra and score_compra >= G_MIN_SCORE and score_compra > score_venda:
+        return ("COMPRA",
+                f"G ATIVA | score {score_compra:.0f} | alvo BTC +{G_TARGET_PCT:.2%} "
+                f"(~+{roe_bruto:.1f}% ROE bruto / ~{roe_liquido:.1f}% líquido em 10x).",
+                fatores_compra, fatores_venda, score_compra, score_venda, detalhes)
+    if ok_venda and score_venda >= G_MIN_SCORE and score_venda > score_compra:
+        return ("VENDA",
+                f"G ATIVA | score {score_venda:.0f} | alvo BTC -{G_TARGET_PCT:.2%} "
+                f"(~+{roe_bruto:.1f}% ROE bruto / ~{roe_liquido:.1f}% líquido em 10x).",
+                fatores_compra, fatores_venda, score_compra, score_venda, detalhes)
+    return ("AGUARDAR",
+            f"G aguardando confirmação | compra {score_compra:.0f} | venda {score_venda:.0f} | mínimo {G_MIN_SCORE:.0f}.",
+            fatores_compra, fatores_venda, score_compra, score_venda, detalhes)
 # ============================================================
 # INDICADORES
 # ============================================================
