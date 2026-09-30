@@ -1309,8 +1309,20 @@ def estrategia_g_signal(row, gex_data, walls_data):
     SHORT: espelho.
     """
     fatores_compra, fatores_venda = [], []
-    if not gex_data or not walls_data:
-        return "AGUARDAR", "G aguardando GEX + Gamma Flip + Walls.", fatores_compra, fatores_venda, 0.0, 0.0, {}
+    # GEX pode existir mesmo quando a rotina de Walls da F não encontrou
+    # uma geometria válida. Nesse caso, não zeramos o painel: mostramos o
+    # estado parcial e deixamos a G aguardando confirmação das Walls.
+    if not gex_data:
+        return "AGUARDAR", "G aguardando dados GEX da Deribit.", fatores_compra, fatores_venda, 0.0, 0.0, {
+            "status": "SEM_GEX",
+        }
+    if not walls_data:
+        return "AGUARDAR", "GEX disponível, mas G aguardando Gamma Flip/Walls válidas.", fatores_compra, fatores_venda, 0.0, 0.0, {
+            "status": "SEM_WALLS",
+            "target_pct": G_TARGET_PCT * 100.0,
+            "leverage_reference": 10.0,
+            "roe_target_pct": G_TARGET_PCT * 100.0 * 10.0,
+        }
 
     try:
         spot = float(row["Close"])
@@ -1342,7 +1354,11 @@ def estrategia_g_signal(row, gex_data, walls_data):
             score += 25.0
             fatores.append(f"GEX expansão normalizado {gex_norm:+.2f}")
         else:
-            return 0.0, fatores
+            # Mantém o score diagnóstico visível mesmo fora do regime de
+            # expansão. A G só pode ser ativada quando o GEX for negativo,
+            # mas os demais componentes continuam sendo calculados para que
+            # o painel mostre por que está aguardando.
+            fatores.append(f"GEX não confirmou expansão ({gex_norm:+.2f})")
 
         if lado == "COMPRA":
             flip_ok = gamma_flip_dist >= 0
@@ -1396,9 +1412,9 @@ def estrategia_g_signal(row, gex_data, walls_data):
         "roe_target_pct": G_TARGET_PCT * 100.0 * 10.0,
     }
 
-    if score_compra >= G_MIN_SCORE and score_compra > score_venda:
+    if score_compra >= G_MIN_SCORE and score_compra > score_venda and gex_norm < 0:
         return "COMPRA", f"G ATIVA | score {score_compra:.0f} | alvo BTC +0,50% (~+5% ROE em 10x).", fatores_compra, fatores_venda, score_compra, score_venda, detalhes
-    if score_venda >= G_MIN_SCORE and score_venda > score_compra:
+    if score_venda >= G_MIN_SCORE and score_venda > score_compra and gex_norm < 0:
         return "VENDA", f"G ATIVA | score {score_venda:.0f} | alvo BTC -0,50% (~+5% ROE em 10x).", fatores_compra, fatores_venda, score_compra, score_venda, detalhes
     return "AGUARDAR", f"G aguardando confirmação | compra {score_compra:.0f} | venda {score_venda:.0f} | mínimo {G_MIN_SCORE:.0f}.", fatores_compra, fatores_venda, score_compra, score_venda, detalhes
 
