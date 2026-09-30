@@ -58,6 +58,16 @@ F_MAX_DTE_HOURS = 48.0
 F_ATM_BAND_PCT = 0.05
 F_MIN_WALL_DISTANCE_PCT = 0.005
 
+# Estratégia G — GEX Expansion 0.50%
+# O alvo de 0,50% é movimento do BTC. A alavancagem 10x NÃO entra no
+# cálculo dos indicadores; ela só transforma aproximadamente +0,50% de
+# movimento do ativo em +5% sobre a margem, antes de custos.
+G_TARGET_PCT = 0.005
+G_MIN_VOLUME_Z = 1.0
+G_MIN_SCORE = 70.0
+G_MAX_WALL_DISTANCE_PCT = 0.005
+G_MAX_GAMMA_FLIP_DISTANCE_PCT = 0.005
+
 # ============================================================
 # PÁGINA / ESTILO
 # ============================================================
@@ -1281,6 +1291,119 @@ def estrategia_f_signal(row, f_estado):
 
 
 # ============================================================
+# ESTRATÉGIA G — GEX EXPANSION 0.50%
+# ============================================================
+def estrategia_g_signal(row, gex_data, walls_data):
+    """GEX Expansion: procura movimento de pelo menos +/-0,50%.
+
+    Importante: 10x NÃO é usado para normalizar GEX, Walls ou Volume Z.
+    Os dados são convertidos para unidades relativas ao preço e comparados
+    com o evento-alvo de 0,50% no BTC.
+
+    LONG:
+      - GEX normalizado negativo (regime de expansão)
+      - spot acima do Gamma Flip
+      - Call Wall dentro de 0,50% do spot
+      - Volume Z >= 1
+
+    SHORT: espelho.
+    """
+    fatores_compra, fatores_venda = [], []
+    if not gex_data or not walls_data:
+        return "AGUARDAR", "G aguardando GEX + Gamma Flip + Walls.", fatores_compra, fatores_venda, 0.0, 0.0, {}
+
+    try:
+        spot = float(row["Close"])
+        volume_z = float(row["volume_z"])
+        gex = float(gex_data["gex_proxy"])
+        gex_calls = abs(float(gex_data.get("gex_calls", 0.0)))
+        gex_puts = abs(float(gex_data.get("gex_puts", 0.0)))
+        gamma_flip = float(walls_data["gamma_flip"])
+        put_wall = float(walls_data["put_wall"])
+        call_wall = float(walls_data["call_wall"])
+    except (TypeError, ValueError, KeyError):
+        return "AGUARDAR", "G sem dados válidos para normalização.", fatores_compra, fatores_venda, 0.0, 0.0, {}
+
+    if not all(np.isfinite([spot, volume_z, gex, gamma_flip, put_wall, call_wall])) or spot <= 0:
+        return "AGUARDAR", "G sem dados numéricos válidos.", fatores_compra, fatores_venda, 0.0, 0.0, {}
+
+    total_abs = gex_calls + gex_puts
+    gex_norm = float(np.clip(gex / total_abs, -1.0, 1.0)) if total_abs > 0 else 0.0
+    gamma_flip_dist = (spot / gamma_flip - 1.0) if gamma_flip > 0 else np.nan
+    put_dist = (spot - put_wall) / spot
+    call_dist = (call_wall - spot) / spot
+
+    # Score direcional 0-100: GEX 25, Flip 20, Wall 30, Volume 15,
+    # proximidade adicional do alvo 0,50% 10.
+    def score_lado(lado):
+        score = 0.0
+        fatores = []
+        if gex_norm < 0:
+            score += 25.0
+            fatores.append(f"GEX expansão normalizado {gex_norm:+.2f}")
+        else:
+            return 0.0, fatores
+
+        if lado == "COMPRA":
+            flip_ok = gamma_flip_dist >= 0
+            wall_dist = call_dist
+            wall_nome = "Call Wall"
+        else:
+            flip_ok = gamma_flip_dist <= 0
+            wall_dist = put_dist
+            wall_nome = "Put Wall"
+
+        if flip_ok:
+            flip_dist_abs = abs(gamma_flip_dist)
+            if flip_dist_abs <= G_MAX_GAMMA_FLIP_DISTANCE_PCT:
+                score += 20.0
+                fatores.append(f"Gamma Flip confirmado | distância {gamma_flip_dist:+.2%}")
+            else:
+                return score, fatores
+        else:
+            return score, fatores
+
+        if 0 <= wall_dist <= G_MAX_WALL_DISTANCE_PCT:
+            proximity = max(0.0, 1.0 - wall_dist / G_MAX_WALL_DISTANCE_PCT)
+            score += 20.0 + 10.0 * proximity
+            fatores.append(f"{wall_nome} a {wall_dist:+.2%} | alvo 0,50%")
+        else:
+            return score, fatores
+
+        volume_score = 15.0 * min(max(volume_z - G_MIN_VOLUME_Z, 0.0) / 2.0 + 0.5, 1.0) if volume_z >= G_MIN_VOLUME_Z else 0.0
+        if volume_z >= G_MIN_VOLUME_Z:
+            score += volume_score
+            fatores.append(f"Volume Z {volume_z:+.2f}")
+        else:
+            return score, fatores
+
+        # 10 pontos adicionais quando a wall está dentro do próprio alvo.
+        if wall_dist <= G_TARGET_PCT:
+            score += 10.0
+        return min(score, 100.0), fatores
+
+    score_compra, fatores_compra = score_lado("COMPRA")
+    score_venda, fatores_venda = score_lado("VENDA")
+
+    detalhes = {
+        "gex_norm": gex_norm,
+        "gamma_flip_dist_pct": gamma_flip_dist * 100.0,
+        "put_wall_dist_pct": put_dist * 100.0,
+        "call_wall_dist_pct": call_dist * 100.0,
+        "target_pct": G_TARGET_PCT * 100.0,
+        "volume_z": volume_z,
+        "leverage_reference": 10.0,
+        "roe_target_pct": G_TARGET_PCT * 100.0 * 10.0,
+    }
+
+    if score_compra >= G_MIN_SCORE and score_compra > score_venda:
+        return "COMPRA", f"G ATIVA | score {score_compra:.0f} | alvo BTC +0,50% (~+5% ROE em 10x).", fatores_compra, fatores_venda, score_compra, score_venda, detalhes
+    if score_venda >= G_MIN_SCORE and score_venda > score_compra:
+        return "VENDA", f"G ATIVA | score {score_venda:.0f} | alvo BTC -0,50% (~+5% ROE em 10x).", fatores_compra, fatores_venda, score_compra, score_venda, detalhes
+    return "AGUARDAR", f"G aguardando confirmação | compra {score_compra:.0f} | venda {score_venda:.0f} | mínimo {G_MIN_SCORE:.0f}.", fatores_compra, fatores_venda, score_compra, score_venda, detalhes
+
+
+# ============================================================
 # INDICADORES
 # ============================================================
 # ============================================================
@@ -1704,19 +1827,20 @@ with st.sidebar:
             "D — GEX + OI ATM + Expiração + Dual",
             "E — Brent/WTI + Sinal BTC",
             "F — GEX Walls / First Touch",
+            "G — GEX Expansion 0.50%",
         ],
         key="cfg_estrategia",
         on_change=salvar_configuracoes,
-        help="A = score técnico; B = reversão; C = rompimento; D = GEX/OI/expiração; E = Brent/WTI; F = GEX Walls com primeiro toque do dia.",
+        help="A = score técnico; B = reversão; C = rompimento; D = GEX/OI/expiração; E = Brent/WTI; F = GEX Walls com primeiro toque; G = GEX Expansion com alvo BTC de 0,50%.",
     )
     automatizar_todas = st.checkbox(
-        "🤖 Automatizar as 6 estratégias",
+        "🤖 Automatizar as 7 estratégias",
         key="cfg_automatizar_todas",
         on_change=salvar_configuracoes,
-        help="Quando ativado, A, B, C, D, E e F são avaliadas a cada candle. A estratégia selecionada acima serve apenas para detalhar o painel.",
+        help="Quando ativado, A, B, C, D, E, F e G são avaliadas a cada candle. A estratégia selecionada acima serve apenas para detalhar o painel.",
     )
     if automatizar_todas:
-        st.success("🤖 A + B + C + D + E + F estão operando automaticamente")
+        st.success("🤖 A + B + C + D + E + F + G estão operando automaticamente")
     else:
         st.warning("Modo individual: somente a estratégia selecionada será executada")
 
@@ -1765,6 +1889,10 @@ with st.sidebar:
             "D abre COMPRA + VENDA com 1 ATR de stop e 2 ATR de alvo quando: "
             "GEX proxy < 0, OI ATM está no percentil 75%+ das expirações disponíveis e a próxima expiração está a até 24h."
         )
+    if estrategia.startswith("G"):
+        st.info(
+            "G transforma GEX, Gamma Flip, Put/Call Wall e Volume Z em variáveis relativas ao preço. Não reduz os indicadores por 10x: 10x só é usado para interpretar o alvo de 0,50% como ~5% sobre a margem. Entrada exige GEX de expansão, confirmação do Gamma Flip, Wall dentro de 0,50% e Volume Z >= 1."
+        )
     if estrategia.startswith("E"):
         st.info(
             "E usa Brent/WTI como filtro de contexto. O ratio é Brent ÷ WTI; a entrada só é liberada quando |Z-score| >= 2,0 e o sinal técnico do BTC confirma COMPRA ou VENDA. O ratio não determina sozinho a direção."
@@ -1811,6 +1939,9 @@ def monitor():
         f_walls = calcular_gex_walls(opcoes, preco_atual) if 'opcoes' in locals() and opcoes else None
         f_estado = f_criar_snapshot(f_walls) if f_walls else f_buscar_estado()
         sinal_f, motivo_f, fatores_f_compra, fatores_f_venda = estrategia_f_signal(row, f_estado)
+        sinal_g, motivo_g, fatores_g_compra, fatores_g_venda, score_g_compra, score_g_venda, g_detalhes = estrategia_g_signal(
+            row, gex_data, f_walls
+        )
 
         if estrategia.startswith("B"):
             strategy_code = "B"
@@ -1822,6 +1953,8 @@ def monitor():
             strategy_code = "E"
         elif estrategia.startswith("F"):
             strategy_code = "F"
+        elif estrategia.startswith("G"):
+            strategy_code = "G"
         else:
             strategy_code = "A"
         ciclo_criado = None
@@ -1836,7 +1969,7 @@ def monitor():
         # Quando automatizar_todas=True, cada estratégia é avaliada no mesmo
         # candle. O limite de operações abertas continua global e a proteção
         # entrada_ja_registrada impede duplicações a cada refresh.
-        estrategias_para_executar = ["A", "B", "C", "D", "E", "F"] if automatizar_todas else [strategy_code]
+        estrategias_para_executar = ["A", "B", "C", "D", "E", "F", "G"] if automatizar_todas else [strategy_code]
 
         sinais_estrategias = {
             "A": sinal,
@@ -1845,6 +1978,7 @@ def monitor():
             "D": "DUAL" if bool(gex_data and gex_data.get("d_ativa")) else "AGUARDAR",
             "E": sinal_e,
             "F": sinal_f,
+            "G": sinal_g,
         }
 
         # A — score técnico original
@@ -2006,6 +2140,33 @@ def monitor():
                 elif low <= call_wall <= high and not (low <= put_wall <= high):
                     f_marcar_primeiro_toque("CALL WALL", signal_time)
 
+        # G — GEX Expansion: alvo fixo de +/-0,50% no BTC.
+        if "G" in estrategias_para_executar:
+            if quantidade_abertas < int(max_operacoes) and sinal_g in ("COMPRA", "VENDA"):
+                if not entrada_ja_registrada(signal_time, strategy="G", side=sinal_g):
+                    entrada = float(preco_atual)
+                    # Alvo de 0,50% e risco de 0,25%: R/R 1:2.
+                    distancia_alvo = entrada * G_TARGET_PCT
+                    distancia_stop = distancia_alvo / 2.0
+                    if sinal_g == "COMPRA":
+                        stop = entrada - distancia_stop
+                        alvo = entrada + distancia_alvo
+                    else:
+                        stop = entrada + distancia_stop
+                        alvo = entrada - distancia_alvo
+                    motivo_g_entrada = motivo_g + " | " + " | ".join(fatores_g_compra if sinal_g == "COMPRA" else fatores_g_venda)
+                    score_g = score_g_compra if sinal_g == "COMPRA" else score_g_venda
+                    trade_id = registrar_trade(
+                        side=sinal_g, entry_price=entrada, stop_price=stop, target_price=alvo,
+                        score=score_g, regime=regime, signal_time=signal_time, row=row,
+                        imbalance=orderbook["imbalance"], score_compra=score_g_compra, score_venda=score_g_venda,
+                        signal=sinal_g, entry_reason=motivo_g_entrada, strategy="G", cycle_id=None,
+                        gex_data=gex_data, ratio_data=ratio_data,
+                        notes="Estratégia G — GEX Expansion 0,50%. Indicadores normalizados em relação ao preço; 10x é referência de execução/ROE, não escala dos indicadores. Alvo BTC +/-0,50%; stop 0,25%; R/R 1:2.",
+                    )
+                    entradas_realizadas.append(f"#{trade_id} G {sinal_g}")
+                    quantidade_abertas += 1
+
         if entradas_realizadas:
             st.success("Nova entrada: " + " | ".join(entradas_realizadas))
 
@@ -2020,6 +2181,8 @@ def monitor():
             sinal_operacional = sinais_estrategias["E"]
         elif strategy_code == "F":
             sinal_operacional = sinais_estrategias["F"]
+        elif strategy_code == "G":
+            sinal_operacional = sinais_estrategias["G"]
         else:
             sinal_operacional = sinais_estrategias["A"]
 
@@ -2037,8 +2200,9 @@ def monitor():
                 {"Estratégia": "D — GEX/Dual", "Sinal": sinais_estrategias["D"]},
                 {"Estratégia": "E — Brent/WTI", "Sinal": sinais_estrategias["E"]},
                 {"Estratégia": "F — GEX Walls", "Sinal": sinais_estrategias["F"]},
+                {"Estratégia": "G — GEX Expansion", "Sinal": sinais_estrategias["G"]},
             ])
-            st.subheader("🤖 Automação — 6 estratégias")
+            st.subheader("🤖 Automação — 7 estratégias")
             st.dataframe(df_sinais, use_container_width=True, hide_index=True)
             st.caption(f"Execução automática ativa. Limite global: {quantidade_abertas}/{int(max_operacoes)} operações abertas.")
 
@@ -2126,16 +2290,44 @@ def monitor():
                     st.write(f"**Put Wall:** ${float(f_estado['put_wall']):,.2f} | **Call Wall:** ${float(f_estado['call_wall']):,.2f}")
                     st.write(f"**Gamma Flip:** ${float(f_estado['gamma_flip']):,.2f} | **Pin:** ${float(f_estado['pin_candidate']):,.2f}")
                     st.write(f"**Centróide GEX:** ${float(f_estado['gamma_centroid']):,.2f} | **Primeiro toque:** {f_estado.get('first_touch_wall') or 'aguardando'}")
+            elif strategy_code == "G":
+                st.write(f"**Sinal G:** {sinal_g}")
+                st.caption(motivo_g)
+                if g_detalhes:
+                    st.write(
+                        f"**GEX norm.:** {g_detalhes.get('gex_norm', 0):+.2f} | "
+                        f"**Gamma Flip:** {g_detalhes.get('gamma_flip_dist_pct', 0):+.2f}% | "
+                        f"**Put Wall:** {g_detalhes.get('put_wall_dist_pct', 0):+.2f}% | "
+                        f"**Call Wall:** {g_detalhes.get('call_wall_dist_pct', 0):+.2f}% | "
+                        f"**Volume Z:** {g_detalhes.get('volume_z', 0):+.2f}"
+                    )
+                    st.write(
+                        f"**Score G:** COMPRA {score_g_compra:.0f} | VENDA {score_g_venda:.0f} | "
+                        f"**Alvo BTC:** ±{G_TARGET_PCT*100:.2f}% | **ROE teórico em 10x:** ±{G_TARGET_PCT*100*10:.1f}%"
+                    )
             sinal_plano = sinal_operacional if sinal_operacional in ("COMPRA", "VENDA") else (sinal if sinal in ("COMPRA", "VENDA") else None)
             if sinal_plano:
-                stop_view, alvo_view = calcular_plano(sinal_plano, preco_atual, float(row["ATR"]))
+                if strategy_code == "G":
+                    distancia_alvo_view = preco_atual * G_TARGET_PCT
+                    distancia_stop_view = distancia_alvo_view / 2.0
+                    if sinal_plano == "COMPRA":
+                        stop_view = preco_atual - distancia_stop_view
+                        alvo_view = preco_atual + distancia_alvo_view
+                    else:
+                        stop_view = preco_atual + distancia_stop_view
+                        alvo_view = preco_atual - distancia_alvo_view
+                else:
+                    stop_view, alvo_view = calcular_plano(sinal_plano, preco_atual, float(row["ATR"]))
                 risco_pct = abs((stop_view / preco_atual) - 1.0) * 100.0
                 alvo_pct = abs((alvo_view / preco_atual) - 1.0) * 100.0
                 risco_rs = float(valor_entrada) * risco_pct / 100.0
                 alvo_rs = float(valor_entrada) * alvo_pct / 100.0
                 st.write(f"**Plano {sinal_plano}:** Entrada ${preco_atual:,.2f} | Stop ${stop_view:,.2f} | Alvo ${alvo_view:,.2f}")
                 st.write(f"**Risco:** -{risco_pct:.3f}% ≈ -R$ {risco_rs:,.2f} | **Alvo:** +{alvo_pct:.3f}% ≈ +R$ {alvo_rs:,.2f} | **R/R:** 1:2")
-                st.caption(f"Valor nominal do paper trade: R$ {valor_entrada:,.2f}")
+                if strategy_code == "G":
+                    st.caption(f"G: alvo fixo de ±{G_TARGET_PCT*100:.2f}% no BTC • referência 10x = ~{G_TARGET_PCT*100*10:.1f}% sobre a margem antes de custos • valor nominal: R$ {valor_entrada:,.2f}")
+                else:
+                    st.caption(f"Valor nominal do paper trade: R$ {valor_entrada:,.2f}")
 
         with right:
             st.subheader("GEX / Opções Deribit")
@@ -2160,6 +2352,12 @@ def monitor():
                     st.success("🟢 Estratégia D ATIVA")
                 else:
                     st.info("⚪ Estratégia D INATIVA")
+                st.markdown("**G — GEX Expansion 0,50%**")
+                gg1, gg2, gg3 = st.columns(3)
+                gg1.metric("Score G COMPRA", f"{score_g_compra:.0f}")
+                gg2.metric("Score G VENDA", f"{score_g_venda:.0f}")
+                gg3.metric("Alvo BTC", f"±{G_TARGET_PCT*100:.2f}%")
+                st.caption(f"ROE teórico em 10x: ±{G_TARGET_PCT*100*10:.1f}% antes de custos • sinal: {sinal_g}")
             else:
                 st.warning(f"GEX indisponível: {gex_erro}")
 
@@ -2260,6 +2458,17 @@ def monitor():
                     "f_first_touch_wall": f_estado.get("first_touch_wall"),
                     "strategy_f_signal": sinal_f,
                 })
+            audit.update({
+                "g_strategy_signal": sinal_g,
+                "g_score_compra": score_g_compra,
+                "g_score_venda": score_g_venda,
+                "g_gex_norm": g_detalhes.get("gex_norm") if g_detalhes else None,
+                "g_gamma_flip_dist_pct": g_detalhes.get("gamma_flip_dist_pct") if g_detalhes else None,
+                "g_put_wall_dist_pct": g_detalhes.get("put_wall_dist_pct") if g_detalhes else None,
+                "g_call_wall_dist_pct": g_detalhes.get("call_wall_dist_pct") if g_detalhes else None,
+                "g_target_pct": G_TARGET_PCT * 100.0,
+                "g_roe_target_10x_pct": G_TARGET_PCT * 100.0 * 10.0,
+            })
             st.dataframe(pd.DataFrame(list(audit.items()), columns=["Indicador", "Valor"]), use_container_width=True, hide_index=True)
 
         # ========================================================
@@ -2286,7 +2495,7 @@ def monitor():
             st.caption("Cada método é simulado separadamente usando somente as operações paper fechadas daquela estratégia. Não é backtest histórico.")
             metodos = [
                 ("A", "A — Atual"), ("B", "B — Reversão"), ("C", "C — Rompimento"),
-                ("D", "D — GEX/Dual"), ("E", "E — Brent/WTI"), ("F", "F — GEX Walls"),
+                ("D", "D — GEX/Dual"), ("E", "E — Brent/WTI"), ("F", "F — GEX Walls"), ("G", "G — GEX Expansion"),
             ]
             cards = []
             historico_banca = buscar_historico(100000)
