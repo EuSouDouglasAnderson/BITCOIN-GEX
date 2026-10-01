@@ -336,6 +336,36 @@ def buscar_operacoes_abertas():
     return df
 
 
+def buscar_operacao_f_relevante():
+    """Retorna a operação F mais relevante para o painel.
+
+    Prioridade:
+      1. operação F ainda aberta;
+      2. última operação F registrada, mesmo que já encerrada.
+
+    Isso evita que o painel perca a entrada/stop/alvo depois que o primeiro
+    toque diário é consumido e o sinal F passa novamente para AGUARDAR.
+    """
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM trades
+            WHERE COALESCE(strategy, 'A') = 'F'
+            ORDER BY
+                CASE WHEN exit_time IS NULL THEN 0 ELSE 1 END,
+                id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        cols = [desc[0] for desc in conn.execute("SELECT * FROM trades LIMIT 1").description]
+        return dict(zip(cols, row))
+    finally:
+        conn.close()
+
+
 def buscar_historico(limite=200):
     conn = get_conn()
     df = pd.read_sql_query(
@@ -2470,10 +2500,98 @@ def monitor():
             elif strategy_code == "F":
                 st.write(f"**Sinal F:** {sinal_f}")
                 st.caption(motivo_f)
+
                 if f_estado:
-                    st.write(f"**Put Wall:** ${float(f_estado['put_wall']):,.2f} | **Call Wall:** ${float(f_estado['call_wall']):,.2f}")
-                    st.write(f"**Gamma Flip:** ${float(f_estado['gamma_flip']):,.2f} | **Pin:** ${float(f_estado['pin_candidate']):,.2f}")
-                    st.write(f"**Centróide GEX:** ${float(f_estado['gamma_centroid']):,.2f} | **Primeiro toque:** {f_estado.get('first_touch_wall') or 'aguardando'}")
+                    put_wall_f = float(f_estado["put_wall"])
+                    call_wall_f = float(f_estado["call_wall"])
+                    operacao_f = buscar_operacao_f_relevante()
+
+                    # A operação registrada no SQLite é a fonte de verdade para
+                    # entrada/stop/alvo depois que o primeiro toque foi consumido.
+                    entrada_f = None
+                    stop_f = None
+                    alvo_f = None
+                    status_operacao_f = "SEM OPERAÇÃO F REGISTRADA"
+
+                    if operacao_f is not None:
+                        try:
+                            entrada_f = float(operacao_f["entry_price"])
+                            stop_f = float(operacao_f["stop_price"])
+                            alvo_f = float(operacao_f["target_price"])
+                            if operacao_f.get("exit_time"):
+                                status_operacao_f = f"ÚLTIMA F ENCERRADA • #{int(operacao_f['id'])}"
+                            else:
+                                status_operacao_f = f"F ABERTA • #{int(operacao_f['id'])}"
+                        except (TypeError, ValueError, KeyError):
+                            entrada_f = stop_f = alvo_f = None
+
+                    # Se ainda não existe uma operação registrada, mas há um novo
+                    # sinal F válido nesta execução, mostramos o plano que será
+                    # usado pelo executor.
+                    if entrada_f is None and sinal_f in ("COMPRA", "VENDA"):
+                        try:
+                            atr_f = float(row["ATR"])
+                            if np.isfinite(atr_f) and atr_f > 0:
+                                entrada_f = float(preco_atual)
+                                stop_f, alvo_f = calcular_plano(sinal_f, entrada_f, atr_f)
+                                status_operacao_f = "PLANO F AGUARDANDO REGISTRO"
+                        except (TypeError, ValueError, KeyError):
+                            pass
+
+                    st.markdown("### 🎯 F — GEX Walls / First Touch")
+
+                    f1, f2, f3 = st.columns(3)
+                    f1.metric("₿ BTC atual", f"US$ {preco_atual:,.2f}")
+                    f2.metric(
+                        "🎯 Entrada F",
+                        f"US$ {entrada_f:,.2f}" if entrada_f is not None else "AGUARDANDO",
+                    )
+                    f3.metric("📍 Put Wall", f"US$ {put_wall_f:,.2f}")
+
+                    f4, f5, f6 = st.columns(3)
+                    f4.metric("📍 Call Wall", f"US$ {call_wall_f:,.2f}")
+                    f5.metric(
+                        "🛑 Stop F",
+                        f"US$ {stop_f:,.2f}" if stop_f is not None else "AGUARDANDO",
+                    )
+                    f6.metric(
+                        "🎯 Alvo F",
+                        f"US$ {alvo_f:,.2f}" if alvo_f is not None else "AGUARDANDO",
+                    )
+
+                    st.write(
+                        f"**Gamma Flip:** US$ {float(f_estado['gamma_flip']):,.2f} | "
+                        f"**Pin:** US$ {float(f_estado['pin_candidate']):,.2f}"
+                    )
+                    st.write(
+                        f"**Centróide GEX:** US$ {float(f_estado['gamma_centroid']):,.2f} | "
+                        f"**Primeiro toque:** {f_estado.get('first_touch_wall') or 'aguardando'}"
+                    )
+
+                    distancia_put = ((preco_atual - put_wall_f) / preco_atual) * 100.0
+                    distancia_call = ((call_wall_f - preco_atual) / preco_atual) * 100.0
+                    st.caption(
+                        f"Distância BTC → Put Wall: {distancia_put:.2f}% | "
+                        f"BTC → Call Wall: {distancia_call:.2f}% | {status_operacao_f}"
+                    )
+
+                    if entrada_f is not None and stop_f is not None and alvo_f is not None:
+                        risco_pct_f = abs((stop_f / entrada_f) - 1.0) * 100.0
+                        alvo_pct_f = abs((alvo_f / entrada_f) - 1.0) * 100.0
+                        risco_rs_f = float(valor_entrada) * risco_pct_f / 100.0
+                        alvo_rs_f = float(valor_entrada) * alvo_pct_f / 100.0
+                        st.write(
+                            f"**Plano F:** Entrada US$ {entrada_f:,.2f} | "
+                            f"Stop US$ {stop_f:,.2f} | Alvo US$ {alvo_f:,.2f} | "
+                            f"Risco {risco_pct_f:.3f}% | Alvo {alvo_pct_f:.3f}% | R/R 1:2"
+                        )
+                        st.caption(
+                            f"Valor nominal do paper trade: R$ {valor_entrada:,.2f} | "
+                            f"Risco teórico: R$ {risco_rs_f:,.2f} | "
+                            f"Alvo teórico: R$ {alvo_rs_f:,.2f}"
+                        )
+                    elif sinal_f not in ("COMPRA", "VENDA"):
+                        st.info("⏳ F aguardando o primeiro toque confirmado. Ainda não existe uma nova entrada operacional.")
             elif strategy_code == "G":
                 st.write(f"**Sinal G:** {sinal_g}")
                 st.caption(motivo_g)
@@ -2490,7 +2608,7 @@ def monitor():
                         f"**Alvo BTC:** ±{G_TARGET_PCT*100:.2f}% | **ROE teórico em 10x:** ±{G_TARGET_PCT*100*10:.1f}%"
                     )
             sinal_plano = sinal_operacional if sinal_operacional in ("COMPRA", "VENDA") else (sinal if sinal in ("COMPRA", "VENDA") else None)
-            if sinal_plano:
+            if sinal_plano and strategy_code != "F":
                 if strategy_code == "G":
                     distancia_alvo_view = preco_atual * G_TARGET_PCT
                     distancia_stop_view = distancia_alvo_view / 2.0
