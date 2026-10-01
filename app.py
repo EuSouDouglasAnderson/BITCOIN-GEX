@@ -1294,7 +1294,7 @@ def estrategia_f_signal(row, f_estado):
 # ESTRATÉGIA G — GEX EXPANSION 0.50% (versão com painel)
 # ============================================================
 import numpy as np
- 
+
 # Constantes (usam o valor do seu módulo se já estiverem definidas; senão, estes padrões).
 # AJUSTE os valores padrão abaixo conforme o seu backtest.
 G_TARGET_PCT = globals().get("G_TARGET_PCT", 0.005)                          # alvo de 0,50%
@@ -1307,8 +1307,8 @@ G_FEE_ROUND_TRIP_PCT = globals().get("G_FEE_ROUND_TRIP_PCT", 0.0010)         # 0
 G_GEX_NORM_THRESHOLD = globals().get("G_GEX_NORM_THRESHOLD", 0.0)            # sugestão: -0.10
 G_MIN_WALL_SPREAD_PCT = globals().get("G_MIN_WALL_SPREAD_PCT", 0.003)        # walls encavaladas < 0,30%
 G_LEVERAGE_REF = 10.0
- 
- 
+
+
 def _detalhes_base(status, **extra):
     """Detalhes mínimos para os retornos antecipados (o painel usa d.get)."""
     d = {
@@ -1320,14 +1320,14 @@ def _detalhes_base(status, **extra):
     }
     d.update(extra)
     return d
- 
- 
+
+
 def estrategia_g_signal(row, gex_data, walls_data):
     """GEX Expansion: procura movimento de pelo menos +/-0,50% no BTC.
- 
+
     10x é usado apenas como referência de ROE, nunca para normalizar
     GEX, Walls ou Volume Z.
- 
+
     Condições de ativação (todas obrigatórias):
       1. GEX normalizado < G_GEX_NORM_THRESHOLD (regime de expansão)
       2. Spot a no máximo G_MAX_GAMMA_FLIP_DISTANCE_PCT do Gamma Flip
@@ -1337,23 +1337,23 @@ def estrategia_g_signal(row, gex_data, walls_data):
       4. Volume Z >= G_MIN_VOLUME_Z
       5. Walls não encavaladas (spread >= G_MIN_WALL_SPREAD_PCT)
       6. Score do lado >= G_MIN_SCORE e maior que o score do lado oposto
- 
+
     Score (0-100): GEX 25 + Flip 20 + Wall 20..30 + Volume 15 + bônus 10
     (bônus quando a wall está além do alvo, ou seja, o caminho até o alvo
     não é barrado por ela).
- 
+
     Retorna: (sinal, mensagem, fatores_compra, fatores_venda,
               score_compra, score_venda, detalhes)
     """
     fatores_compra, fatores_venda = [], []
- 
+
     if not gex_data:
         return "AGUARDAR", "G aguardando dados GEX da Deribit.", fatores_compra, fatores_venda, 0.0, 0.0, \
             _detalhes_base("SEM_GEX")
     if not walls_data:
         return "AGUARDAR", "GEX disponível, mas G aguardando Gamma Flip/Walls válidas.", \
             fatores_compra, fatores_venda, 0.0, 0.0, _detalhes_base("SEM_WALLS")
- 
+
     try:
         spot = float(row["Close"])
         volume_z = float(row["volume_z"])
@@ -1366,12 +1366,12 @@ def estrategia_g_signal(row, gex_data, walls_data):
     except (TypeError, ValueError, KeyError):
         return "AGUARDAR", "G sem dados válidos para normalização.", fatores_compra, fatores_venda, 0.0, 0.0, \
             _detalhes_base("DADOS_INVALIDOS")
- 
+
     valores = [spot, volume_z, gex, gex_calls, gex_puts, gamma_flip, put_wall, call_wall]
     if not all(np.isfinite(valores)) or spot <= 0 or gamma_flip <= 0 or put_wall <= 0 or call_wall <= 0:
         return "AGUARDAR", "G sem dados numéricos válidos.", fatores_compra, fatores_venda, 0.0, 0.0, \
             _detalhes_base("DADOS_NAO_NUMERICOS")
- 
+
     total_abs = gex_calls + gex_puts
     gex_norm = float(np.clip(gex / total_abs, -1.0, 1.0)) if total_abs > 0 else 0.0
     gamma_flip_dist = spot / gamma_flip - 1.0
@@ -1379,17 +1379,17 @@ def estrategia_g_signal(row, gex_data, walls_data):
     call_dist = (call_wall - spot) / spot
     wall_spread = abs(call_wall - put_wall) / spot
     walls_ok = wall_spread >= G_MIN_WALL_SPREAD_PCT
- 
+
     def score_lado(lado):
         """Calcula todos os componentes (sem retorno antecipado).
- 
+
         Retorna (score, fatores, gates). O lado só é ativável se
         all(gates.values()) for True.
         """
         score = 0.0
         fatores = []
         gates = {}
- 
+
         # 1. GEX
         gex_ok = gex_norm < G_GEX_NORM_THRESHOLD
         gates["GEX"] = gex_ok
@@ -1398,7 +1398,7 @@ def estrategia_g_signal(row, gex_data, walls_data):
             fatores.append(f"GEX expansão normalizado {gex_norm:+.2f}")
         else:
             fatores.append(f"GEX não confirmou expansão ({gex_norm:+.2f})")
- 
+
         # 2. Gamma Flip
         if lado == "COMPRA":
             wall_dist, wall_nome = call_dist, "Call Wall"
@@ -1406,7 +1406,7 @@ def estrategia_g_signal(row, gex_data, walls_data):
         else:
             wall_dist, wall_nome = put_dist, "Put Wall"
             lado_flip_ok = gamma_flip_dist <= 0
- 
+
         perto_flip = abs(gamma_flip_dist) <= G_MAX_GAMMA_FLIP_DISTANCE_PCT
         flip_ok = perto_flip and (lado_flip_ok if G_FLIP_DIRECTIONAL else True)
         gates["Flip"] = flip_ok
@@ -1419,7 +1419,7 @@ def estrategia_g_signal(row, gex_data, walls_data):
             )
         else:
             fatores.append(f"Gamma Flip do lado errado para {lado} ({gamma_flip_dist:+.2%})")
- 
+
         # 3. Wall
         wall_ok = 0 <= wall_dist <= G_MAX_WALL_DISTANCE_PCT
         gates["Wall"] = wall_ok
@@ -1429,7 +1429,7 @@ def estrategia_g_signal(row, gex_data, walls_data):
             fatores.append(f"{wall_nome} a {wall_dist:+.2%} | alvo {G_TARGET_PCT:.2%}")
         else:
             fatores.append(f"{wall_nome} fora da faixa ({wall_dist:+.2%})")
- 
+
         # 4. Volume
         vol_ok = volume_z >= G_MIN_VOLUME_Z
         gates["Volume"] = vol_ok
@@ -1438,7 +1438,7 @@ def estrategia_g_signal(row, gex_data, walls_data):
             fatores.append(f"Volume Z {volume_z:+.2f}")
         else:
             fatores.append(f"Volume Z fraco ({volume_z:+.2f} < {G_MIN_VOLUME_Z:.2f})")
- 
+
         # 5. Walls encavaladas (gate; não altera o score)
         gates["Spread"] = walls_ok
         if walls_ok:
@@ -1447,22 +1447,22 @@ def estrategia_g_signal(row, gex_data, walls_data):
             fatores.append(
                 f"Walls encavaladas (spread {wall_spread:.2%} < {G_MIN_WALL_SPREAD_PCT:.2%})"
             )
- 
+
         # Bônus: wall além do alvo (não barra o movimento antes de 0,50%)
         if wall_ok and wall_dist >= G_TARGET_PCT:
             score += 10.0
             fatores.append("Wall além do alvo (caminho livre)")
- 
+
         return min(score, 100.0), fatores, gates
- 
+
     score_compra, fatores_compra, gates_compra = score_lado("COMPRA")
     score_venda, fatores_venda, gates_venda = score_lado("VENDA")
     ok_compra = all(gates_compra.values())
     ok_venda = all(gates_venda.values())
- 
+
     roe_bruto = G_TARGET_PCT * 100.0 * G_LEVERAGE_REF
     roe_liquido = (G_TARGET_PCT - G_FEE_ROUND_TRIP_PCT) * 100.0 * G_LEVERAGE_REF
- 
+
     detalhes = _detalhes_base(
         "OK",
         spot=spot,
@@ -1482,7 +1482,7 @@ def estrategia_g_signal(row, gex_data, walls_data):
         gates_compra=gates_compra,
         gates_venda=gates_venda,
     )
- 
+
     if ok_compra and score_compra >= G_MIN_SCORE and score_compra > score_venda:
         return ("COMPRA",
                 f"G ATIVA | score {score_compra:.0f} | alvo BTC +{G_TARGET_PCT:.2%} "
@@ -1496,13 +1496,13 @@ def estrategia_g_signal(row, gex_data, walls_data):
     return ("AGUARDAR",
             f"G aguardando confirmação | compra {score_compra:.0f} | venda {score_venda:.0f} | mínimo {G_MIN_SCORE:.0f}.",
             fatores_compra, fatores_venda, score_compra, score_venda, detalhes)
- 
- 
+
+
 def painel_g(sinal, score_c, score_v, d):
     """Texto do painel da estratégia G (use d.get: retornos antecipados têm poucos campos)."""
     ok = lambda b: "✅" if b else "❌"
     titulo = f"G — GEX Expansion {d.get('target_pct', G_TARGET_PCT * 100.0):.2f}%  |  {sinal}"
- 
+
     if d.get("status") != "OK":
         return "\n".join([
             titulo,
@@ -1510,7 +1510,7 @@ def painel_g(sinal, score_c, score_v, d):
             f"Score COMPRA {score_c:.0f} | VENDA {score_v:.0f} (mín. {d.get('min_score', G_MIN_SCORE):.0f})",
             f"Alvo BTC: ±{d.get('target_pct', 0):.2f}%",
         ])
- 
+
     linhas = [
         titulo,
         f"Spot: {d['spot']:,.2f}  |  Alvo: ↑ {d['target_up']:,.2f}  ↓ {d['target_down']:,.2f}",
@@ -1525,11 +1525,68 @@ def painel_g(sinal, score_c, score_v, d):
         "VENDA:  " + "  ".join(f"{k} {ok(v)}" for k, v in d["gates_venda"].items()),
     ]
     return "\n".join(linhas)
- 
- 
+
+
+def card_g_campos(sinal, score_c, score_v, d):
+    """Lista de (rótulo, valor) para o card, no mesmo estilo do painel atual.
+
+    Use direto no seu card: for rotulo, valor in card_g_campos(...): ...
+    """
+    ok = lambda b: "✅" if b else "❌"
+    campos = [
+        ("Score G COMPRA", f"{score_c:.0f}"),
+        ("Score G VENDA", f"{score_v:.0f}"),
+        ("Alvo BTC", f"±{d.get('target_pct', G_TARGET_PCT * 100.0):.2f}%"),
+    ]
+
+    if d.get("status") != "OK":
+        campos.append(("Status", str(d.get("status", "SEM_DADOS"))))
+        campos.append(("Sinal", sinal))
+        return campos
+
+    campos += [
+        ("Preço BTC (spot)", f"US$ {d['spot']:,.2f}"),
+        ("Alvo ↑ (compra)", f"US$ {d['target_up']:,.2f}"),
+        ("Alvo ↓ (venda)", f"US$ {d['target_down']:,.2f}"),
+        ("Gamma Flip", f"US$ {d['gamma_flip']:,.0f} ({d['gamma_flip_dist_pct']:+.2f}%)"),
+        ("Call Wall", f"US$ {d['call_wall']:,.0f} ({d['call_wall_dist_pct']:+.2f}%)"),
+        ("Put Wall", f"US$ {d['put_wall']:,.0f} ({d['put_wall_dist_pct']:+.2f}%)"),
+        ("Spread das walls", f"{d['wall_spread_pct']:.2f}%"),
+        ("GEX normalizado", f"{d['gex_norm']:+.2f} (bruto {d['gex_raw']:,.0f})"),
+        ("Volume Z", f"{d['volume_z']:+.2f} (mín. {G_MIN_VOLUME_Z:.2f})"),
+        ("ROE teórico em 10x", f"±{d['roe_target_pct']:.1f}% bruto / ±{d['roe_net_est_pct']:.1f}% líquido"),
+        ("Condições COMPRA", "  ".join(f"{k} {ok(v)}" for k, v in d["gates_compra"].items())),
+        ("Condições VENDA", "  ".join(f"{k} {ok(v)}" for k, v in d["gates_venda"].items())),
+        ("Mínimo para ativar", f"{d['min_score']:.0f}"),
+        ("Sinal", sinal),
+    ]
+    return campos
+
+
+def card_g_html(sinal, score_c, score_v, d):
+    """Card em HTML puro com todas as informações da estratégia G."""
+    from html import escape
+    cor = {"COMPRA": "#16a34a", "VENDA": "#dc2626"}.get(sinal, "#6b7280")
+    linhas = "".join(
+        f"<div style='display:flex;justify-content:space-between;gap:16px;"
+        f"padding:4px 0;border-bottom:1px solid #2a2f3a'>"
+        f"<span style='opacity:.7'>{escape(r)}</span><b>{escape(v)}</b></div>"
+        for r, v in card_g_campos(sinal, score_c, score_v, d)
+    )
+    return (
+        f"<div style='font-family:sans-serif;background:#161a23;color:#e5e7eb;"
+        f"border-radius:12px;padding:16px;border-left:6px solid {cor};max-width:520px'>"
+        f"<div style='font-size:16px;font-weight:700;margin-bottom:8px'>"
+        f"G — GEX Expansion {d.get('target_pct', G_TARGET_PCT * 100.0):.2f}% "
+        f"<span style='color:{cor}'>• {escape(sinal)}</span></div>{linhas}</div>"
+    )
+
+
 # Exemplo de uso:
 # sinal, msg, f_c, f_v, s_c, s_v, det = estrategia_g_signal(row, gex_data, walls_data)
-# print(painel_g(sinal, s_c, s_v, det))
+# print(painel_g(sinal, s_c, s_v, det))                            # texto simples
+# for rotulo, valor in card_g_campos(sinal, s_c, s_v, det): ...    # no seu card atual
+# html = card_g_html(sinal, s_c, s_v, det)                         # card pronto em HTML
 # ============================================================
 # INDICADORES
 # ============================================================
