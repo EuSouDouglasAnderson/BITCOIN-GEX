@@ -2220,7 +2220,14 @@ def monitor():
             row, gex_data, f_walls
         )
         if g_detalhes is not None:
+            # A G calcula o sinal sobre a última vela FECHADA, mas o painel
+            # deve distinguir isso do preço BTC em tempo real.
             g_detalhes["captured_price"] = float(row["Close"])
+            g_detalhes["current_price"] = float(preco_atual)
+            g_detalhes["last_candle_open"] = float(row["Open"])
+            g_detalhes["last_candle_high"] = float(row["High"])
+            g_detalhes["last_candle_low"] = float(row["Low"])
+            g_detalhes["last_candle_close"] = float(row["Close"])
             g_detalhes["signal_time_brt"] = signal_time.to_pydatetime().replace(tzinfo=timezone.utc).astimezone(ZoneInfo(F_BRASILIA_TZ)) if hasattr(signal_time, "to_pydatetime") else signal_time
 
         if estrategia.startswith("B"):
@@ -2811,32 +2818,45 @@ def monitor():
                         entrada_g_painel = None
 
                 if g_detalhes and g_detalhes.get("status") == "OK":
-                    spot_g = float(g_detalhes["spot"])
+                    # G usa a última vela fechada para o sinal. O painel,
+                    # porém, mostra o ticker em tempo real separadamente.
+                    spot_sinal_g = float(g_detalhes["spot"])
+                    spot_atual_g = float(g_detalhes.get("current_price", preco_atual))
                     call_wall_g = float(g_detalhes["call_wall"])
                     put_wall_g = float(g_detalhes["put_wall"])
                     gamma_flip_g = float(g_detalhes["gamma_flip"])
-                    dist_call_g = (call_wall_g - spot_g) / spot_g
-                    dist_put_g = (spot_g - put_wall_g) / spot_g
-                    alvo_compra_g = spot_g * (1 + G_TARGET_PCT)
-                    alvo_venda_g = spot_g * (1 - G_TARGET_PCT)
-                    candle_low_g = float(row["Low"])
-                    candle_high_g = float(row["High"])
+                    dist_call_g = (call_wall_g - spot_atual_g) / spot_atual_g
+                    dist_put_g = (spot_atual_g - put_wall_g) / spot_atual_g
+
+                    # Se já existe uma operação G, os alvos exibidos são os da
+                    # entrada real. Sem entrada, são alvos teóricos a partir do
+                    # BTC atual.
+                    base_alvo_g = entrada_g_painel if entrada_g_painel is not None else spot_atual_g
+                    alvo_compra_g = base_alvo_g * (1 + G_TARGET_PCT)
+                    alvo_venda_g = base_alvo_g * (1 - G_TARGET_PCT)
+
+                    candle_low_g = float(g_detalhes.get("last_candle_low", row["Low"]))
+                    candle_high_g = float(g_detalhes.get("last_candle_high", row["High"]))
                     sniper_call_g = candle_low_g <= call_wall_g <= candle_high_g
                     sniper_put_g = candle_low_g <= put_wall_g <= candle_high_g
 
                     pg1, pg2, pg3 = st.columns(3)
-                    pg1.metric("₿ BTC atual", f"US$ {spot_g:,.2f}")
-                    pg2.metric("📅 Abertura hoje", f"US$ {abertura_hoje_g:,.2f}" if abertura_hoje_g is not None else "N/D")
+                    pg1.metric("₿ BTC atual", f"US$ {spot_atual_g:,.2f}")
+                    pg2.metric("📅 Abertura hoje (BRT)", f"US$ {abertura_hoje_g:,.2f}" if abertura_hoje_g is not None else "N/D")
                     pg3.metric("🎯 Preço que a G pegou", f"US$ {entrada_g_painel:,.2f}" if entrada_g_painel is not None else "SEM ENTRADA")
 
                     horario_captura = g_detalhes.get("signal_time_brt")
                     if entrada_g_painel is not None:
-                        variacao_g = (spot_g / entrada_g_painel - 1.0) * 100.0
+                        variacao_g = (spot_atual_g / entrada_g_painel - 1.0) * 100.0
                         st.caption(f"{status_g_painel} • Variação desde a entrada: {variacao_g:+.2f}%")
                     elif horario_captura is not None:
-                        st.caption(f"Última vela analisada: {horario_captura.strftime('%d/%m/%Y %H:%M')} BRT • sem entrada G registrada")
+                        st.caption(f"Última vela analisada: {horario_captura.strftime('%d/%m/%Y %H:%M')} BRT • fechamento US$ {spot_sinal_g:,.2f} • sem entrada G registrada")
                     if horario_abertura_g is not None:
                         st.caption(f"Abertura do dia: {horario_abertura_g.strftime('%d/%m/%Y %H:%M')} BRT")
+                    st.caption(
+                        f"Fonte BTC: Binance {SYMBOL} • sinal calculado na última vela fechada • "
+                        f"BTC atual = ticker em tempo real • horário do painel: {datetime.now(timezone.utc).astimezone(ZoneInfo(F_BRASILIA_TZ)).strftime('%d/%m/%Y %H:%M:%S')} BRT"
+                    )
 
                     gg1, gg2, gg3, gg4 = st.columns(4)
                     gg1.metric("Score G COMPRA", f"{score_g_compra:.0f}")
