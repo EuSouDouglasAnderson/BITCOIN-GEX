@@ -36,6 +36,7 @@ BRENT_YAHOO = "BZ=F"
 WTI_YAHOO = "CL=F"
 E_RATIO_WINDOW = 100
 E_RATIO_Z_THRESHOLD = 2.0
+E_REQUIRE_NEW_EXTREME = True
 E_RATIO_INTERVAL = "5m"
 E_RATIO_RANGE = "5d"
 
@@ -58,15 +59,15 @@ F_MAX_DTE_HOURS = 48.0
 F_ATM_BAND_PCT = 0.05
 F_MIN_WALL_DISTANCE_PCT = 0.005
 
-# Estratégia G — GEX Expansion 1.50%
-# O alvo de 1,50% é movimento do BTC. A alavancagem 10x NÃO entra no
-# cálculo dos indicadores; ela só transforma aproximadamente +1,50% de
+# Estratégia G — GEX Expansion 0.50%
+# O alvo de 0,50% é movimento do BTC. A alavancagem 10x NÃO entra no
+# cálculo dos indicadores; ela só transforma aproximadamente +0,50% de
 # movimento do ativo em +5% sobre a margem, antes de custos.
-G_TARGET_PCT = 0.015
+G_TARGET_PCT = 0.005
 G_MIN_VOLUME_Z = 1.0
 G_MIN_SCORE = 70.0
-G_MAX_WALL_DISTANCE_PCT = 0.015
-G_MAX_GAMMA_FLIP_DISTANCE_PCT = 0.015
+G_MAX_WALL_DISTANCE_PCT = 0.005
+G_MAX_GAMMA_FLIP_DISTANCE_PCT = 0.005
 
 # ============================================================
 # PÁGINA / ESTILO
@@ -241,7 +242,6 @@ def salvar_configuracoes():
         "estrategia": st.session_state.get("cfg_estrategia", "A — Atual"),
         "max_operacoes": int(st.session_state.get("cfg_max_operacoes", 5)),
         "tempo_maximo": int(st.session_state.get("cfg_tempo_maximo", 60)),
-        "banca_inicial": float(st.session_state.get("cfg_banca_inicial", 1000.0)),
         "valor_entrada": float(st.session_state.get("cfg_valor_entrada", 100.0)),
         "automatizar_todas": bool(st.session_state.get("cfg_automatizar_todas", True)),
     }
@@ -276,6 +276,7 @@ def inicializar_configuracoes_session():
         "D — GEX + OI ATM + Expiração + Dual",
         "E — Brent/WTI + Sinal BTC",
         "F — GEX Walls / First Touch",
+        "G — GEX Expansion 0.50%",
     ]
 
     estrategia_salva = salvas.get("estrategia", "A — Atual")
@@ -285,7 +286,6 @@ def inicializar_configuracoes_session():
     st.session_state["cfg_estrategia"] = estrategia_salva
     st.session_state["cfg_max_operacoes"] = int(salvas.get("max_operacoes", 5))
     st.session_state["cfg_tempo_maximo"] = int(salvas.get("tempo_maximo", 60))
-    st.session_state["cfg_banca_inicial"] = float(salvas.get("banca_inicial", 1000.0))
     st.session_state["cfg_valor_entrada"] = float(salvas.get("valor_entrada", 100.0))
     # Compatibilidade com versões anteriores que salvavam percentual
     if "valor_entrada" not in salvas and "percentual_entrada" in salvas:
@@ -296,7 +296,6 @@ def inicializar_configuracoes_session():
     # Garante que valores antigos/inválidos não quebrem os widgets.
     st.session_state["cfg_max_operacoes"] = min(50, max(1, st.session_state["cfg_max_operacoes"]))
     st.session_state["cfg_tempo_maximo"] = min(1440, max(5, st.session_state["cfg_tempo_maximo"]))
-    st.session_state["cfg_banca_inicial"] = max(1.0, st.session_state["cfg_banca_inicial"])
     st.session_state["cfg_valor_entrada"] = max(1.0, float(st.session_state["cfg_valor_entrada"]))
 
 
@@ -669,17 +668,29 @@ def buscar_serie_yahoo(ticker, range_value=E_RATIO_RANGE, interval=E_RATIO_INTER
 
 @st.cache_data(ttl=30, show_spinner=False)
 def calcular_ratio_brent_wti():
+    """Calcula o ratio Brent/WTI e identifica entrada em novo extremo."""
     brent = buscar_serie_yahoo(BRENT_YAHOO).rename(columns={"close": "brent"})
     wti = buscar_serie_yahoo(WTI_YAHOO).rename(columns={"close": "wti"})
+
     df_ratio = pd.merge(brent, wti, on="timestamp", how="inner")
     df_ratio = df_ratio[(df_ratio["brent"] > 0) & (df_ratio["wti"] > 0)].copy()
     df_ratio["ratio"] = df_ratio["brent"] / df_ratio["wti"]
     df_ratio["ratio_mean"] = df_ratio["ratio"].rolling(E_RATIO_WINDOW).mean()
     df_ratio["ratio_std"] = df_ratio["ratio"].rolling(E_RATIO_WINDOW).std()
-    df_ratio["z"] = (df_ratio["ratio"] - df_ratio["ratio_mean"]) / df_ratio["ratio_std"].replace(0, np.nan)
+    df_ratio["z"] = (
+        (df_ratio["ratio"] - df_ratio["ratio_mean"])
+        / df_ratio["ratio_std"].replace(0, np.nan)
+    )
     df_ratio["change"] = df_ratio["ratio"].pct_change()
-    ultimo = df_ratio.iloc[-1]
-    z = float(ultimo["z"]) if pd.notna(ultimo["z"]) else np.nan
+
+    if len(df_ratio) < 2:
+        return {"ready": False, "reason": "Dados insuficientes para calcular o evento do ratio."}
+
+    atual = df_ratio.iloc[-1]
+    anterior = df_ratio.iloc[-2]
+    z = float(atual["z"]) if pd.notna(atual["z"]) else np.nan
+    z_prev = float(anterior["z"]) if pd.notna(anterior["z"]) else np.nan
+
     if np.isfinite(z) and z >= E_RATIO_Z_THRESHOLD:
         condition = "RATIO ALTO / EXTREMO"
     elif np.isfinite(z) and z <= -E_RATIO_Z_THRESHOLD:
@@ -688,36 +699,57 @@ def calcular_ratio_brent_wti():
         condition = "RATIO NORMAL"
     else:
         condition = "RATIO INSUFICIENTE"
+
+    novo_extremo = False
+    if np.isfinite(z) and np.isfinite(z_prev):
+        entrou_extremo_alto = z >= E_RATIO_Z_THRESHOLD and z_prev < E_RATIO_Z_THRESHOLD
+        entrou_extremo_baixo = z <= -E_RATIO_Z_THRESHOLD and z_prev > -E_RATIO_Z_THRESHOLD
+        novo_extremo = entrou_extremo_alto or entrou_extremo_baixo
+
     return {
-        "brent_price": float(ultimo["brent"]),
-        "wti_price": float(ultimo["wti"]),
-        "ratio": float(ultimo["ratio"]),
-        "ratio_mean": float(ultimo["ratio_mean"]) if pd.notna(ultimo["ratio_mean"]) else None,
-        "ratio_std": float(ultimo["ratio_std"]) if pd.notna(ultimo["ratio_std"]) else None,
+        "brent_price": float(atual["brent"]),
+        "wti_price": float(atual["wti"]),
+        "ratio": float(atual["ratio"]),
+        "ratio_mean": float(atual["ratio_mean"]) if pd.notna(atual["ratio_mean"]) else None,
+        "ratio_std": float(atual["ratio_std"]) if pd.notna(atual["ratio_std"]) else None,
         "z": z if np.isfinite(z) else None,
-        "change": float(ultimo["change"]) if pd.notna(ultimo["change"]) else None,
+        "z_prev": z_prev if np.isfinite(z_prev) else None,
+        "change": float(atual["change"]) if pd.notna(atual["change"]) else None,
         "condition": condition,
+        "new_extreme": novo_extremo,
         "ready": bool(np.isfinite(z)),
     }
 
 
 def estrategia_e_signal(sinal_tecnico, ratio_data):
     """
-    Estratégia E usa Brent/WTI como filtro de contexto, não como previsão
-    direcional isolada: só libera o sinal técnico quando o ratio está em
-    extremo (|Z| >= 2). A direção continua vindo do modelo técnico BTC.
+    Estratégia E usa Brent/WTI como evento independente.
+
+    Para evitar entradas repetidas, E só libera uma operação quando o Z-score
+    entra em um novo extremo. Permanecer acima/abaixo de 2 desvios não gera
+    novas entradas a cada refresh/candle.
     """
     if not ratio_data or not ratio_data.get("ready"):
         return "AGUARDAR", "E sem Z-score suficiente para o ratio Brent/WTI."
+
     z = float(ratio_data["z"])
     if abs(z) < E_RATIO_Z_THRESHOLD:
         return "AGUARDAR", f"E bloqueada: |Z| {abs(z):.2f} < {E_RATIO_Z_THRESHOLD:.1f}."
+
+    if E_REQUIRE_NEW_EXTREME and not ratio_data.get("new_extreme", False):
+        return "AGUARDAR", (
+            f"E em extremo persistente, sem novo evento | Z atual {z:+.2f} | "
+            f"Z anterior {ratio_data.get('z_prev', float('nan')):+.2f}."
+        )
+
     if sinal_tecnico not in ("COMPRA", "VENDA"):
-        return "AGUARDAR", "E encontrou extremo no ratio, mas o sinal técnico BTC não confirmou direção."
+        return "AGUARDAR", "E entrou em extremo, mas o BTC não confirmou direção técnica."
+
     return sinal_tecnico, (
-        f"E confirmada | Brent ${ratio_data['brent_price']:.2f} | WTI ${ratio_data['wti_price']:.2f} | "
-        f"Ratio {ratio_data['ratio']:.4f} | Z {z:+.2f} | {ratio_data['condition']} | "
-        f"direção BTC confirmada pelo sinal técnico {sinal_tecnico}."
+        f"E NOVO EXTREMO | Brent ${ratio_data['brent_price']:.2f} | "
+        f"WTI ${ratio_data['wti_price']:.2f} | Ratio {ratio_data['ratio']:.4f} | "
+        f"Z {z:+.2f} | Z anterior {ratio_data.get('z_prev', float('nan')):+.2f} | "
+        f"direção BTC confirmada: {sinal_tecnico}."
     )
 
 
@@ -1321,21 +1353,21 @@ def estrategia_f_signal(row, f_estado):
 
 
 # ============================================================
-# ESTRATÉGIA G — GEX EXPANSION 1.50% (versão com painel)
+# ESTRATÉGIA G — GEX EXPANSION 0.50% (versão com painel)
 # ============================================================
 import numpy as np
 
 # Constantes (usam o valor do seu módulo se já estiverem definidas; senão, estes padrões).
 # AJUSTE os valores padrão abaixo conforme o seu backtest.
-G_TARGET_PCT = globals().get("G_TARGET_PCT", 0.015)                          # alvo de 1,50%
-G_MAX_GAMMA_FLIP_DISTANCE_PCT = globals().get("G_MAX_GAMMA_FLIP_DISTANCE_PCT", 0.015)
-G_MAX_WALL_DISTANCE_PCT = globals().get("G_MAX_WALL_DISTANCE_PCT", 0.015)
+G_TARGET_PCT = globals().get("G_TARGET_PCT", 0.005)                          # alvo de 0,50%
+G_MAX_GAMMA_FLIP_DISTANCE_PCT = globals().get("G_MAX_GAMMA_FLIP_DISTANCE_PCT", 0.010)
+G_MAX_WALL_DISTANCE_PCT = globals().get("G_MAX_WALL_DISTANCE_PCT", 0.010)
 G_MIN_VOLUME_Z = globals().get("G_MIN_VOLUME_Z", 0.5)
 G_MIN_SCORE = globals().get("G_MIN_SCORE", 60.0)
 G_FLIP_DIRECTIONAL = globals().get("G_FLIP_DIRECTIONAL", False)
 G_FEE_ROUND_TRIP_PCT = globals().get("G_FEE_ROUND_TRIP_PCT", 0.0010)         # 0,05% taker x 2 lados
 G_GEX_NORM_THRESHOLD = globals().get("G_GEX_NORM_THRESHOLD", 0.0)            # sugestão: -0.10
-G_MIN_WALL_SPREAD_PCT = globals().get("G_MIN_WALL_SPREAD_PCT", 0.018)        # walls encavaladas < 1,80%
+G_MIN_WALL_SPREAD_PCT = globals().get("G_MIN_WALL_SPREAD_PCT", 0.003)        # walls encavaladas < 0,30%
 G_LEVERAGE_REF = 10.0
 
 
@@ -1353,7 +1385,7 @@ def _detalhes_base(status, **extra):
 
 
 def estrategia_g_signal(row, gex_data, walls_data):
-    """GEX Expansion: procura movimento de pelo menos +/-1,50% no BTC.
+    """GEX Expansion: procura movimento de pelo menos +/-0,50% no BTC.
 
     10x é usado apenas como referência de ROE, nunca para normalizar
     GEX, Walls ou Volume Z.
@@ -1478,7 +1510,7 @@ def estrategia_g_signal(row, gex_data, walls_data):
                 f"Walls encavaladas (spread {wall_spread:.2%} < {G_MIN_WALL_SPREAD_PCT:.2%})"
             )
 
-        # Bônus: wall além do alvo (não barra o movimento antes de 1,50%)
+        # Bônus: wall além do alvo (não barra o movimento antes de 0,50%)
         if wall_ok and wall_dist >= G_TARGET_PCT:
             score += 10.0
             fatores.append("Wall além do alvo (caminho livre)")
@@ -2041,11 +2073,11 @@ with st.sidebar:
             "D — GEX + OI ATM + Expiração + Dual",
             "E — Brent/WTI + Sinal BTC",
             "F — GEX Walls / First Touch",
-            "G — GEX Expansion 1.50%",
+            "G — GEX Expansion 0.50%",
         ],
         key="cfg_estrategia",
         on_change=salvar_configuracoes,
-        help="A = score técnico; B = reversão; C = rompimento; D = GEX/OI/expiração; E = Brent/WTI; F = GEX Walls com primeiro toque; G = GEX Expansion com alvo BTC de 1,50%.",
+        help="A = score técnico; B = reversão; C = rompimento; D = GEX/OI/expiração; E = Brent/WTI; F = GEX Walls com primeiro toque; G = GEX Expansion com alvo BTC de 0,50%.",
     )
     automatizar_todas = st.checkbox(
         "🤖 Automatizar as 7 estratégias",
@@ -2070,18 +2102,12 @@ with st.sidebar:
         key="cfg_tempo_maximo",
         on_change=salvar_configuracoes,
     )
-    banca_inicial = st.number_input(
-        "Banca inicial da simulação (R$)",
-        min_value=1.0, step=100.0,
-        key="cfg_banca_inicial",
-        on_change=salvar_configuracoes,
-    )
     valor_entrada = st.number_input(
         "Valor por operação (R$)",
         min_value=1.0, max_value=100000.0, step=10.0,
         key="cfg_valor_entrada",
         on_change=salvar_configuracoes,
-        help="Valor nominal usado no paper trading e na simulação da banca. Padrão: R$ 100,00.",
+        help="Valor nominal usado no paper trading e no cálculo independente por método. Padrão: R$ 100,00.",
     )
     st.divider()
     st.write(f"**Stop:** {ATR_STOP_MULTIPLIER:.1f} × ATR")
@@ -2105,11 +2131,11 @@ with st.sidebar:
         )
     if estrategia.startswith("G"):
         st.info(
-            "G transforma GEX, Gamma Flip, Put/Call Wall e Volume Z em variáveis relativas ao preço. Não reduz os indicadores por 10x: 10x só é usado para interpretar o alvo de 1,50% como ~15% sobre a margem. Entrada exige GEX de expansão, confirmação do Gamma Flip, Wall dentro de 1,50% e Volume Z >= 1."
+            "G transforma GEX, Gamma Flip, Put/Call Wall e Volume Z em variáveis relativas ao preço. Não reduz os indicadores por 10x: 10x só é usado para interpretar o alvo de 0,50% como ~5% sobre a margem. Entrada exige GEX de expansão, confirmação do Gamma Flip, Wall dentro de 0,50% e Volume Z >= 1."
         )
     if estrategia.startswith("E"):
         st.info(
-            "E usa Brent/WTI como filtro de contexto. O ratio é Brent ÷ WTI; a entrada só é liberada quando |Z-score| >= 2,0 e o sinal técnico do BTC confirma COMPRA ou VENDA. O ratio não determina sozinho a direção."
+            "E usa Brent/WTI como evento de contexto. A entrada só ocorre quando o Z-score entra em um novo extremo (|Z| >= 2,0), o BTC confirma COMPRA/VENDA e não existe uma entrada A igual no mesmo candle."
         )
 
 # ============================================================
@@ -2145,10 +2171,9 @@ def monitor():
         except Exception as exc:
             ratio_erro = str(exc)
 
-        if estrategia.startswith("E"):
-            sinal_e, motivo_e_status = estrategia_e_signal(sinal, ratio_data)
-        else:
-            sinal_e, motivo_e_status = sinal, ""
+        # E é calculada sempre que os dados do ratio estão disponíveis.
+        # Isso evita que o modo "Automatizar todas" use acidentalmente a A como sinal da E.
+        sinal_e, motivo_e_status = estrategia_e_signal(sinal, ratio_data)
 
         f_walls = calcular_gex_walls(opcoes, preco_atual) if 'opcoes' in locals() and opcoes else None
         f_estado = f_criar_snapshot(f_walls) if f_walls else f_buscar_estado()
@@ -2292,7 +2317,13 @@ def monitor():
                         sinal_e, score_compra, score_venda, regime,
                         fatores_compra, fatores_venda, ratio_data
                     )
-                    if not entrada_ja_registrada(signal_time, strategy="E", side=sinal_e):
+
+                    # E é complementar à A, não uma segunda entrada para o
+                    # mesmo evento. Se A já entrou no mesmo candle/lado, E não duplica.
+                    mesma_entrada_da_a = entrada_ja_registrada(
+                        signal_time, strategy="A", side=sinal_e
+                    )
+                    if not mesma_entrada_da_a and not entrada_ja_registrada(signal_time, strategy="E", side=sinal_e):
                         atr = float(row["ATR"])
                         if np.isfinite(atr) and atr > 0:
                             entrada = float(preco_atual)
@@ -2304,7 +2335,7 @@ def monitor():
                                 imbalance=orderbook["imbalance"], score_compra=score_compra, score_venda=score_venda,
                                 signal=sinal_e, entry_reason=motivo_e, strategy="E", cycle_id=None,
                                 gex_data=gex_data, ratio_data=ratio_data,
-                                notes="Estratégia E — extremo do ratio Brent/WTI (|Z| >= 2) + confirmação técnica BTC.",
+                                notes="Estratégia E — entrada em novo extremo Brent/WTI (|Z| >= 2) + confirmação técnica BTC; sem duplicar entrada A no mesmo candle.",
                             )
                             entradas_realizadas.append(f"#{trade_id} E {sinal_e}")
                             quantidade_abertas += 1
@@ -2354,12 +2385,12 @@ def monitor():
                 elif low <= call_wall <= high and not (low <= put_wall <= high):
                     f_marcar_primeiro_toque("CALL WALL", signal_time)
 
-        # G — GEX Expansion: alvo fixo de +/-1,50% no BTC.
+        # G — GEX Expansion: alvo fixo de +/-0,50% no BTC.
         if "G" in estrategias_para_executar:
             if quantidade_abertas < int(max_operacoes) and sinal_g in ("COMPRA", "VENDA"):
                 if not entrada_ja_registrada(signal_time, strategy="G", side=sinal_g):
                     entrada = float(preco_atual)
-                    # Alvo de 1,50% e risco de 0,75%: R/R 1:2.
+                    # Alvo de 0,50% e risco de 0,25%: R/R 1:2.
                     distancia_alvo = entrada * G_TARGET_PCT
                     distancia_stop = distancia_alvo / 2.0
                     if sinal_g == "COMPRA":
@@ -2376,7 +2407,7 @@ def monitor():
                         imbalance=orderbook["imbalance"], score_compra=score_g_compra, score_venda=score_g_venda,
                         signal=sinal_g, entry_reason=motivo_g_entrada, strategy="G", cycle_id=None,
                         gex_data=gex_data, ratio_data=ratio_data,
-                        notes="Estratégia G — GEX Expansion 1,50%. Indicadores normalizados em relação ao preço; 10x é referência de execução/ROE, não escala dos indicadores. Alvo BTC +/-1,50%; stop 0,75%; R/R 1:2.",
+                        notes="Estratégia G — GEX Expansion 0,50%. Indicadores normalizados em relação ao preço; 10x é referência de execução/ROE, não escala dos indicadores. Alvo BTC +/-0,50%; stop 0,25%; R/R 1:2.",
                     )
                     entradas_realizadas.append(f"#{trade_id} G {sinal_g}")
                     quantidade_abertas += 1
@@ -2654,7 +2685,7 @@ def monitor():
                     st.success("🟢 Estratégia D ATIVA")
                 else:
                     st.info("⚪ Estratégia D INATIVA")
-                st.markdown("**G — GEX Expansion 1,50%**")
+                st.markdown("**G — GEX Expansion 0,50%**")
                 gg1, gg2, gg3 = st.columns(3)
                 gg1.metric("Score G COMPRA", f"{score_g_compra:.0f}")
                 gg2.metric("Score G VENDA", f"{score_g_venda:.0f}")
@@ -2770,6 +2801,9 @@ def monitor():
                 "g_call_wall_dist_pct": g_detalhes.get("call_wall_dist_pct") if g_detalhes else None,
                 "g_target_pct": G_TARGET_PCT * 100.0,
                 "g_roe_target_10x_pct": G_TARGET_PCT * 100.0 * 10.0,
+                "e_z": ratio_data.get("z") if ratio_data else None,
+                "e_z_prev": ratio_data.get("z_prev") if ratio_data else None,
+                "e_novo_extremo": ratio_data.get("new_extreme") if ratio_data else None,
             })
             st.dataframe(pd.DataFrame(list(audit.items()), columns=["Indicador", "Valor"]), use_container_width=True, hide_index=True)
 
@@ -2793,8 +2827,8 @@ def monitor():
             cols = ["#", "Estratégia", "Ciclo", "Lado", "Entrada", "Preço entrada", "Stop", "Alvo", "Saída", "Preço saída", "P&L %", "Resultado", "Saída por", "Score", "Regime"]
             st.dataframe(hist[cols], use_container_width=True, hide_index=True)
 
-            st.markdown("### 💰 Banca por método — início de R$ 1.000")
-            st.caption("Cada método é simulado separadamente usando somente as operações paper fechadas daquela estratégia. Não é backtest histórico.")
+            st.markdown("### 💰 Resultado por método — base independente de R$ 1.000")
+            st.caption("Cada método é calculado separadamente a partir das operações paper fechadas daquela estratégia. Não é backtest histórico.")
             metodos = [
                 ("A", "A — Atual"), ("B", "B — Reversão"), ("C", "C — Rompimento"),
                 ("D", "D — GEX/Dual"), ("E", "E — Brent/WTI"), ("F", "F — GEX Walls"), ("G", "G — GEX Expansion"),
@@ -2817,33 +2851,6 @@ def monitor():
                     st.metric(nome_metodo, f"R$ {final_metodo:,.2f}", f"{lucro_metodo:+,.2f} R$")
                     st.caption(f"Início R$ 1.000,00 • {operacoes_metodo} operações fechadas")
 
-            st.markdown("### 💰 Simulação da banca geral")
-            sim, banca_final = simular_banca(historico, banca_inicial, valor_entrada)
-            st.caption(
-                f"Banca inicial: R$ {banca_inicial:,.2f} • Entrada fixa: R$ {valor_entrada:,.2f} por operação • "
-                f"Na D, COMPRA e VENDA são duas operações e cada uma usa R$ {valor_entrada:,.2f}."
-            )
-            if sim.empty:
-                st.info("A simulação aparecerá após a primeira operação fechada.")
-            else:
-                ganhos = int((sim["Resultado"] == "GANHO").sum())
-                perdas = int((sim["Resultado"] == "PERDA").sum())
-                lucro = banca_final - float(banca_inicial)
-                retorno = lucro / float(banca_inicial) * 100
-                b1, b2, b3, b4 = st.columns(4)
-                b1.metric("Banca atual", f"R$ {banca_final:,.2f}")
-                b2.metric("Lucro / prejuízo", f"R$ {lucro:+,.2f}")
-                b3.metric("Retorno", f"{retorno:+.2f}%")
-                b4.metric("Ganhas / Perdidas", f"{ganhos} / {perdas}")
-                sim_exib = sim.copy()
-                sim_exib["P&L mercado %"] = sim_exib["P&L mercado %"].map(lambda x: f"{x:+.2f}%")
-                for col in ["Banca antes", "Valor entrada", "Resultado R$", "Banca depois"]:
-                    sim_exib[col] = sim_exib[col].map(lambda x: f"R$ {x:,.2f}")
-                st.dataframe(
-                    sim_exib[["#", "Estratégia", "Ciclo", "Lado", "Entrada", "Saída", "P&L mercado %", "Banca antes", "Entrada %", "Valor entrada", "Resultado R$", "Banca depois", "Resultado", "Saída por"]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
             ultimo = historico.iloc[0]
             with st.expander("📋 Motivo da última operação registrada"):
