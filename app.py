@@ -1559,6 +1559,9 @@ def estrategia_g_signal(row, gex_data, walls_data):
         trigger_pct=G_TARGET_PCT * 100.0,
         roe_net_est_pct=roe_liquido,
         signal_time=row.get("close_time") if hasattr(row, "get") else None,
+        current_price=None,
+        last_candle_low=float(row["Low"]),
+        last_candle_high=float(row["High"]),
         gates_compra=gates_compra,
         gates_venda=gates_venda,
     )
@@ -2724,10 +2727,14 @@ def monitor():
                     g4.metric("ROE teórico 10x", f"±{G_TARGET_PCT*100*10:.1f}%")
 
                     st.markdown("**GEX Walls / Sniper no toque**")
+                    # Painel resumido da G: as distâncias também usam o BTC atual.
+                    dist_call_resumo = (call_wall_g / spot_g - 1.0) * 100.0
+                    dist_put_resumo = (put_wall_g / spot_g - 1.0) * 100.0
+                    dist_flip_resumo = (gamma_flip_g / spot_g - 1.0) * 100.0
                     w1, w2, w3 = st.columns(3)
-                    w1.metric("📍 Call Wall", f"US$ {call_wall_g:,.0f}", f"{dist_call:+.2f}%")
-                    w2.metric("📍 Put Wall", f"US$ {put_wall_g:,.0f}", f"{dist_put:+.2f}%")
-                    w3.metric("Gamma Flip", f"US$ {gamma_flip_g:,.0f}", f"{g_detalhes.get('gamma_flip_dist_pct', 0):+.2f}%")
+                    w1.metric("📍 Call Wall", f"US$ {call_wall_g:,.0f}", f"{dist_call_resumo:+.2f}% vs BTC")
+                    w2.metric("📍 Put Wall", f"US$ {put_wall_g:,.0f}", f"{dist_put_resumo:+.2f}% vs BTC")
+                    w3.metric("Gamma Flip", f"US$ {gamma_flip_g:,.0f}", f"{dist_flip_resumo:+.2f}% vs BTC")
 
                     st.write(
                         f"**Sniper Call a seco:** {'🎯 TOQUE' if sniper_call else '⏳ AGUARDANDO TOQUE'} | "
@@ -2825,8 +2832,12 @@ def monitor():
                     call_wall_g = float(g_detalhes["call_wall"])
                     put_wall_g = float(g_detalhes["put_wall"])
                     gamma_flip_g = float(g_detalhes["gamma_flip"])
-                    dist_call_g = (call_wall_g - spot_atual_g) / spot_atual_g
-                    dist_put_g = (spot_atual_g - put_wall_g) / spot_atual_g
+                    # Distância operacional das Walls SEM ambiguidade:
+                    # Call: quanto falta o BTC subir até a Call Wall.
+                    # Put: quanto o BTC precisa cair até a Put Wall.
+                    # Ambas usam exclusivamente o ticker BTC atual mostrado no painel.
+                    dist_call_g = (call_wall_g / spot_atual_g - 1.0)
+                    dist_put_g = (put_wall_g / spot_atual_g - 1.0)
 
                     # Se já existe uma operação G, os alvos exibidos são os da
                     # entrada real. Sem entrada, são alvos teóricos a partir do
@@ -2870,9 +2881,29 @@ def monitor():
                     )
 
                     wg1, wg2, wg3 = st.columns(3)
-                    wg1.metric("📍 Call Wall", f"US$ {call_wall_g:,.0f}", f"{dist_call_g:+.2f}%")
-                    wg2.metric("📍 Put Wall", f"US$ {put_wall_g:,.0f}", f"{dist_put_g:+.2f}%")
-                    wg3.metric("Gamma Flip", f"US$ {gamma_flip_g:,.0f}", f"{g_detalhes.get('gamma_flip_dist_pct', 0):+.2f}%")
+                    wg1.metric(
+                        "📍 Call Wall",
+                        f"US$ {call_wall_g:,.0f}",
+                        f"{dist_call_g * 100:+.2f}% vs BTC atual",
+                    )
+                    wg2.metric(
+                        "📍 Put Wall",
+                        f"US$ {put_wall_g:,.0f}",
+                        f"{dist_put_g * 100:+.2f}% vs BTC atual",
+                    )
+                    gamma_flip_dist_atual = (gamma_flip_g / spot_atual_g - 1.0) * 100.0
+                    wg3.metric(
+                        "Gamma Flip",
+                        f"US$ {gamma_flip_g:,.0f}",
+                        f"{gamma_flip_dist_atual:+.2f}% vs BTC atual",
+                    )
+
+                    st.caption(
+                        f"Distâncias calculadas sobre BTC atual US$ {spot_atual_g:,.2f}: "
+                        f"Call Wall {dist_call_g * 100:+.2f}% | "
+                        f"Put Wall {dist_put_g * 100:+.2f}% | "
+                        f"Gamma Flip {gamma_flip_dist_atual:+.2f}%"
+                    )
 
                     st.write(
                         f"**Sniper Call a seco:** {'🎯 TOQUE' if sniper_call_g else '⏳ AGUARDANDO TOQUE'}  |  "
