@@ -2793,12 +2793,88 @@ def monitor():
                     st.success("🟢 Estratégia D ATIVA")
                 else:
                     st.info("⚪ Estratégia D INATIVA")
+                # G — painel operacional completo (também visível quando outra estratégia está selecionada)
                 st.markdown("**G — GEX Expansion 1,50%**")
-                gg1, gg2, gg3 = st.columns(3)
-                gg1.metric("Score G COMPRA", f"{score_g_compra:.0f}")
-                gg2.metric("Score G VENDA", f"{score_g_venda:.0f}")
-                gg3.metric("Alvo BTC", f"±{G_TARGET_PCT*100:.2f}%")
-                st.caption(f"ROE teórico em 10x: ±{G_TARGET_PCT*100*10:.1f}% antes de custos • sinal: {sinal_g}")
+                abertura_hoje_g, horario_abertura_g = obter_abertura_dia_brasilia(df)
+                operacao_g_painel = buscar_operacao_g_relevante()
+                entrada_g_painel = None
+                status_g_painel = "SEM OPERAÇÃO G REGISTRADA"
+                if operacao_g_painel is not None:
+                    try:
+                        entrada_g_painel = float(operacao_g_painel["entry_price"])
+                        status_g_painel = (
+                            f"G ABERTA • #{int(operacao_g_painel['id'])}"
+                            if not operacao_g_painel.get("exit_time")
+                            else f"ÚLTIMA G ENCERRADA • #{int(operacao_g_painel['id'])}"
+                        )
+                    except (TypeError, ValueError, KeyError):
+                        entrada_g_painel = None
+
+                if g_detalhes and g_detalhes.get("status") == "OK":
+                    spot_g = float(g_detalhes["spot"])
+                    call_wall_g = float(g_detalhes["call_wall"])
+                    put_wall_g = float(g_detalhes["put_wall"])
+                    gamma_flip_g = float(g_detalhes["gamma_flip"])
+                    dist_call_g = (call_wall_g - spot_g) / spot_g
+                    dist_put_g = (spot_g - put_wall_g) / spot_g
+                    alvo_compra_g = spot_g * (1 + G_TARGET_PCT)
+                    alvo_venda_g = spot_g * (1 - G_TARGET_PCT)
+                    candle_low_g = float(row["Low"])
+                    candle_high_g = float(row["High"])
+                    sniper_call_g = candle_low_g <= call_wall_g <= candle_high_g
+                    sniper_put_g = candle_low_g <= put_wall_g <= candle_high_g
+
+                    pg1, pg2, pg3 = st.columns(3)
+                    pg1.metric("₿ BTC atual", f"US$ {spot_g:,.2f}")
+                    pg2.metric("📅 Abertura hoje", f"US$ {abertura_hoje_g:,.2f}" if abertura_hoje_g is not None else "N/D")
+                    pg3.metric("🎯 Preço que a G pegou", f"US$ {entrada_g_painel:,.2f}" if entrada_g_painel is not None else "SEM ENTRADA")
+
+                    horario_captura = g_detalhes.get("signal_time_brt")
+                    if entrada_g_painel is not None:
+                        variacao_g = (spot_g / entrada_g_painel - 1.0) * 100.0
+                        st.caption(f"{status_g_painel} • Variação desde a entrada: {variacao_g:+.2f}%")
+                    elif horario_captura is not None:
+                        st.caption(f"Última vela analisada: {horario_captura.strftime('%d/%m/%Y %H:%M')} BRT • sem entrada G registrada")
+                    if horario_abertura_g is not None:
+                        st.caption(f"Abertura do dia: {horario_abertura_g.strftime('%d/%m/%Y %H:%M')} BRT")
+
+                    gg1, gg2, gg3, gg4 = st.columns(4)
+                    gg1.metric("Score G COMPRA", f"{score_g_compra:.0f}")
+                    gg2.metric("Score G VENDA", f"{score_g_venda:.0f}")
+                    gg3.metric("Gatilho mínimo", f"{G_TARGET_PCT*100:.2f}%")
+                    gg4.metric("ROE teórico 10x", f"±{G_TARGET_PCT*100*10:.1f}%")
+
+                    st.write(
+                        f"**Alvo COMPRA:** US$ {alvo_compra_g:,.2f} (+{G_TARGET_PCT*100:.2f}%)  |  "
+                        f"**Alvo VENDA:** US$ {alvo_venda_g:,.2f} (-{G_TARGET_PCT*100:.2f}%)"
+                    )
+
+                    wg1, wg2, wg3 = st.columns(3)
+                    wg1.metric("📍 Call Wall", f"US$ {call_wall_g:,.0f}", f"{dist_call_g:+.2f}%")
+                    wg2.metric("📍 Put Wall", f"US$ {put_wall_g:,.0f}", f"{dist_put_g:+.2f}%")
+                    wg3.metric("Gamma Flip", f"US$ {gamma_flip_g:,.0f}", f"{g_detalhes.get('gamma_flip_dist_pct', 0):+.2f}%")
+
+                    st.write(
+                        f"**Sniper Call a seco:** {'🎯 TOQUE' if sniper_call_g else '⏳ AGUARDANDO TOQUE'}  |  "
+                        f"**Sniper Put a seco:** {'🎯 TOQUE' if sniper_put_g else '⏳ AGUARDANDO TOQUE'}"
+                    )
+                    st.write(
+                        f"**GEX:** {g_detalhes.get('gex_norm', 0):+.2f} normalizado ({g_detalhes.get('gex_raw', 0):,.0f} bruto)  |  "
+                        f"**Volume Z:** {g_detalhes.get('volume_z', 0):+.2f}  |  "
+                        f"**Spread Walls:** {g_detalhes.get('wall_spread_pct', 0):.2f}%"
+                    )
+
+                    gates_c = g_detalhes.get("gates_compra", {})
+                    gates_v = g_detalhes.get("gates_venda", {})
+                    st.write(
+                        "**Gatilhos COMPRA:** " + " | ".join(f"{k} {'✅' if v else '❌'}" for k, v in gates_c.items())
+                    )
+                    st.write(
+                        "**Gatilhos VENDA:** " + " | ".join(f"{k} {'✅' if v else '❌'}" for k, v in gates_v.items())
+                    )
+                    st.caption(f"Status G: **{sinal_g}** • {motivo_g}")
+                else:
+                    st.warning("G aguardando dados suficientes de GEX/Walls para montar o painel operacional.")
             else:
                 st.warning(f"GEX indisponível: {gex_erro}")
 
