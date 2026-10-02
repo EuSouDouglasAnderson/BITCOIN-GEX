@@ -58,15 +58,15 @@ F_MAX_DTE_HOURS = 48.0
 F_ATM_BAND_PCT = 0.05
 F_MIN_WALL_DISTANCE_PCT = 0.005
 
-# Estratégia G — GEX Expansion 0.50%
-# O alvo de 0,50% é movimento do BTC. A alavancagem 10x NÃO entra no
-# cálculo dos indicadores; ela só transforma aproximadamente +0,50% de
+# Estratégia G — GEX Expansion 1.50%
+# O alvo de 1,50% é movimento do BTC. A alavancagem 10x NÃO entra no
+# cálculo dos indicadores; ela só transforma aproximadamente +1,50% de
 # movimento do ativo em +5% sobre a margem, antes de custos.
-G_TARGET_PCT = 0.005
+G_TARGET_PCT = 0.015
 G_MIN_VOLUME_Z = 1.0
 G_MIN_SCORE = 70.0
-G_MAX_WALL_DISTANCE_PCT = 0.005
-G_MAX_GAMMA_FLIP_DISTANCE_PCT = 0.005
+G_MAX_WALL_DISTANCE_PCT = 0.015
+G_MAX_GAMMA_FLIP_DISTANCE_PCT = 0.015
 
 # ============================================================
 # PÁGINA / ESTILO
@@ -1321,21 +1321,21 @@ def estrategia_f_signal(row, f_estado):
 
 
 # ============================================================
-# ESTRATÉGIA G — GEX EXPANSION 0.50% (versão com painel)
+# ESTRATÉGIA G — GEX EXPANSION 1.50% (versão com painel)
 # ============================================================
 import numpy as np
 
 # Constantes (usam o valor do seu módulo se já estiverem definidas; senão, estes padrões).
 # AJUSTE os valores padrão abaixo conforme o seu backtest.
-G_TARGET_PCT = globals().get("G_TARGET_PCT", 0.005)                          # alvo de 0,50%
-G_MAX_GAMMA_FLIP_DISTANCE_PCT = globals().get("G_MAX_GAMMA_FLIP_DISTANCE_PCT", 0.010)
-G_MAX_WALL_DISTANCE_PCT = globals().get("G_MAX_WALL_DISTANCE_PCT", 0.010)
+G_TARGET_PCT = globals().get("G_TARGET_PCT", 0.015)                          # alvo de 1,50%
+G_MAX_GAMMA_FLIP_DISTANCE_PCT = globals().get("G_MAX_GAMMA_FLIP_DISTANCE_PCT", 0.015)
+G_MAX_WALL_DISTANCE_PCT = globals().get("G_MAX_WALL_DISTANCE_PCT", 0.015)
 G_MIN_VOLUME_Z = globals().get("G_MIN_VOLUME_Z", 0.5)
 G_MIN_SCORE = globals().get("G_MIN_SCORE", 60.0)
 G_FLIP_DIRECTIONAL = globals().get("G_FLIP_DIRECTIONAL", False)
 G_FEE_ROUND_TRIP_PCT = globals().get("G_FEE_ROUND_TRIP_PCT", 0.0010)         # 0,05% taker x 2 lados
 G_GEX_NORM_THRESHOLD = globals().get("G_GEX_NORM_THRESHOLD", 0.0)            # sugestão: -0.10
-G_MIN_WALL_SPREAD_PCT = globals().get("G_MIN_WALL_SPREAD_PCT", 0.003)        # walls encavaladas < 0,30%
+G_MIN_WALL_SPREAD_PCT = globals().get("G_MIN_WALL_SPREAD_PCT", 0.018)        # walls encavaladas < 1,80%
 G_LEVERAGE_REF = 10.0
 
 
@@ -1353,7 +1353,7 @@ def _detalhes_base(status, **extra):
 
 
 def estrategia_g_signal(row, gex_data, walls_data):
-    """GEX Expansion: procura movimento de pelo menos +/-0,50% no BTC.
+    """GEX Expansion: procura movimento de pelo menos +/-1,50% no BTC.
 
     10x é usado apenas como referência de ROE, nunca para normalizar
     GEX, Walls ou Volume Z.
@@ -1478,7 +1478,7 @@ def estrategia_g_signal(row, gex_data, walls_data):
                 f"Walls encavaladas (spread {wall_spread:.2%} < {G_MIN_WALL_SPREAD_PCT:.2%})"
             )
 
-        # Bônus: wall além do alvo (não barra o movimento antes de 0,50%)
+        # Bônus: wall além do alvo (não barra o movimento antes de 1,50%)
         if wall_ok and wall_dist >= G_TARGET_PCT:
             score += 10.0
             fatores.append("Wall além do alvo (caminho livre)")
@@ -2041,11 +2041,11 @@ with st.sidebar:
             "D — GEX + OI ATM + Expiração + Dual",
             "E — Brent/WTI + Sinal BTC",
             "F — GEX Walls / First Touch",
-            "G — GEX Expansion 0.50%",
+            "G — GEX Expansion 1.50%",
         ],
         key="cfg_estrategia",
         on_change=salvar_configuracoes,
-        help="A = score técnico; B = reversão; C = rompimento; D = GEX/OI/expiração; E = Brent/WTI; F = GEX Walls com primeiro toque; G = GEX Expansion com alvo BTC de 0,50%.",
+        help="A = score técnico; B = reversão; C = rompimento; D = GEX/OI/expiração; E = Brent/WTI; F = GEX Walls com primeiro toque; G = GEX Expansion com alvo BTC de 1,50%.",
     )
     automatizar_todas = st.checkbox(
         "🤖 Automatizar as 7 estratégias",
@@ -2105,7 +2105,7 @@ with st.sidebar:
         )
     if estrategia.startswith("G"):
         st.info(
-            "G transforma GEX, Gamma Flip, Put/Call Wall e Volume Z em variáveis relativas ao preço. Não reduz os indicadores por 10x: 10x só é usado para interpretar o alvo de 0,50% como ~5% sobre a margem. Entrada exige GEX de expansão, confirmação do Gamma Flip, Wall dentro de 0,50% e Volume Z >= 1."
+            "G transforma GEX, Gamma Flip, Put/Call Wall e Volume Z em variáveis relativas ao preço. Não reduz os indicadores por 10x: 10x só é usado para interpretar o alvo de 1,50% como ~15% sobre a margem. Entrada exige GEX de expansão, confirmação do Gamma Flip, Wall dentro de 1,50% e Volume Z >= 1."
         )
     if estrategia.startswith("E"):
         st.info(
@@ -2354,12 +2354,12 @@ def monitor():
                 elif low <= call_wall <= high and not (low <= put_wall <= high):
                     f_marcar_primeiro_toque("CALL WALL", signal_time)
 
-        # G — GEX Expansion: alvo fixo de +/-0,50% no BTC.
+        # G — GEX Expansion: alvo fixo de +/-1,50% no BTC.
         if "G" in estrategias_para_executar:
             if quantidade_abertas < int(max_operacoes) and sinal_g in ("COMPRA", "VENDA"):
                 if not entrada_ja_registrada(signal_time, strategy="G", side=sinal_g):
                     entrada = float(preco_atual)
-                    # Alvo de 0,50% e risco de 0,25%: R/R 1:2.
+                    # Alvo de 1,50% e risco de 0,75%: R/R 1:2.
                     distancia_alvo = entrada * G_TARGET_PCT
                     distancia_stop = distancia_alvo / 2.0
                     if sinal_g == "COMPRA":
@@ -2376,7 +2376,7 @@ def monitor():
                         imbalance=orderbook["imbalance"], score_compra=score_g_compra, score_venda=score_g_venda,
                         signal=sinal_g, entry_reason=motivo_g_entrada, strategy="G", cycle_id=None,
                         gex_data=gex_data, ratio_data=ratio_data,
-                        notes="Estratégia G — GEX Expansion 0,50%. Indicadores normalizados em relação ao preço; 10x é referência de execução/ROE, não escala dos indicadores. Alvo BTC +/-0,50%; stop 0,25%; R/R 1:2.",
+                        notes="Estratégia G — GEX Expansion 1,50%. Indicadores normalizados em relação ao preço; 10x é referência de execução/ROE, não escala dos indicadores. Alvo BTC +/-1,50%; stop 0,75%; R/R 1:2.",
                     )
                     entradas_realizadas.append(f"#{trade_id} G {sinal_g}")
                     quantidade_abertas += 1
@@ -2654,7 +2654,7 @@ def monitor():
                     st.success("🟢 Estratégia D ATIVA")
                 else:
                     st.info("⚪ Estratégia D INATIVA")
-                st.markdown("**G — GEX Expansion 0,50%**")
+                st.markdown("**G — GEX Expansion 1,50%**")
                 gg1, gg2, gg3 = st.columns(3)
                 gg1.metric("Score G COMPRA", f"{score_g_compra:.0f}")
                 gg2.metric("Score G VENDA", f"{score_g_venda:.0f}")
