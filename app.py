@@ -59,15 +59,15 @@ F_MAX_DTE_HOURS = 48.0
 F_ATM_BAND_PCT = 0.05
 F_MIN_WALL_DISTANCE_PCT = 0.005
 
-# Estratégia G — GEX Expansion 0.50%
-# O alvo de 0,50% é movimento do BTC. A alavancagem 10x NÃO entra no
-# cálculo dos indicadores; ela só transforma aproximadamente +0,50% de
-# movimento do ativo em +5% sobre a margem, antes de custos.
-G_TARGET_PCT = 0.005
+# Estratégia G — GEX Expansion 1.50%
+# O alvo de 1,50% é movimento do BTC. A alavancagem 10x NÃO entra no
+# cálculo dos indicadores; ela só transforma aproximadamente +1,50% de
+# movimento do ativo em +15% sobre a margem, antes de custos.
+G_TARGET_PCT = 0.015
 G_MIN_VOLUME_Z = 1.0
 G_MIN_SCORE = 70.0
-G_MAX_WALL_DISTANCE_PCT = 0.005
-G_MAX_GAMMA_FLIP_DISTANCE_PCT = 0.005
+G_MAX_WALL_DISTANCE_PCT = 0.015
+G_MAX_GAMMA_FLIP_DISTANCE_PCT = 0.015
 
 # ============================================================
 # PÁGINA / ESTILO
@@ -276,7 +276,7 @@ def inicializar_configuracoes_session():
         "D — GEX + OI ATM + Expiração + Dual",
         "E — Brent/WTI + Sinal BTC",
         "F — GEX Walls / First Touch",
-        "G — GEX Expansion 0.50%",
+        "G — GEX Expansion 1.50%",
     ]
 
     estrategia_salva = salvas.get("estrategia", "A — Atual")
@@ -610,6 +610,22 @@ def buscar_klines():
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
     return df
+
+
+def obter_abertura_dia_brasilia(df):
+    """Retorna a abertura do dia civil atual em America/Sao_Paulo."""
+    if df is None or df.empty:
+        return None, None
+    tz_brt = ZoneInfo(F_BRASILIA_TZ)
+    agora_brt = datetime.now(timezone.utc).astimezone(tz_brt)
+    inicio_brt = agora_brt.replace(hour=0, minute=0, second=0, microsecond=0)
+    inicio_utc = inicio_brt.astimezone(timezone.utc).replace(tzinfo=None)
+    mask = df["open_time"] >= inicio_utc
+    hoje = df.loc[mask].copy()
+    if hoje.empty:
+        return None, None
+    primeira = hoje.iloc[0]
+    return float(primeira["Open"]), primeira["open_time"].to_pydatetime().replace(tzinfo=timezone.utc).astimezone(tz_brt)
 
 
 @st.cache_data(ttl=2, show_spinner=False)
@@ -1353,17 +1369,17 @@ def estrategia_f_signal(row, f_estado):
 
 
 # ============================================================
-# ESTRATÉGIA G — GEX EXPANSION 0.50% (versão com painel)
+# ESTRATÉGIA G — GEX EXPANSION 1.50% (versão com painel)
 # ============================================================
 import numpy as np
 
 # Constantes (usam o valor do seu módulo se já estiverem definidas; senão, estes padrões).
 # AJUSTE os valores padrão abaixo conforme o seu backtest.
-G_TARGET_PCT = globals().get("G_TARGET_PCT", 0.005)                          # alvo de 0,50%
-G_MAX_GAMMA_FLIP_DISTANCE_PCT = globals().get("G_MAX_GAMMA_FLIP_DISTANCE_PCT", 0.010)
-G_MAX_WALL_DISTANCE_PCT = globals().get("G_MAX_WALL_DISTANCE_PCT", 0.010)
-G_MIN_VOLUME_Z = globals().get("G_MIN_VOLUME_Z", 0.5)
-G_MIN_SCORE = globals().get("G_MIN_SCORE", 60.0)
+G_TARGET_PCT = globals().get("G_TARGET_PCT", 0.015)
+G_MAX_GAMMA_FLIP_DISTANCE_PCT = globals().get("G_MAX_GAMMA_FLIP_DISTANCE_PCT", 0.015)
+G_MAX_WALL_DISTANCE_PCT = globals().get("G_MAX_WALL_DISTANCE_PCT", 0.015)
+G_MIN_VOLUME_Z = globals().get("G_MIN_VOLUME_Z", 1.0)
+G_MIN_SCORE = globals().get("G_MIN_SCORE", 70.0)
 G_FLIP_DIRECTIONAL = globals().get("G_FLIP_DIRECTIONAL", False)
 G_FEE_ROUND_TRIP_PCT = globals().get("G_FEE_ROUND_TRIP_PCT", 0.0010)         # 0,05% taker x 2 lados
 G_GEX_NORM_THRESHOLD = globals().get("G_GEX_NORM_THRESHOLD", 0.0)            # sugestão: -0.10
@@ -1385,7 +1401,7 @@ def _detalhes_base(status, **extra):
 
 
 def estrategia_g_signal(row, gex_data, walls_data):
-    """GEX Expansion: procura movimento de pelo menos +/-0,50% no BTC.
+    """GEX Expansion: procura movimento de pelo menos +/-1,50% no BTC.
 
     10x é usado apenas como referência de ROE, nunca para normalizar
     GEX, Walls ou Volume Z.
@@ -1510,7 +1526,7 @@ def estrategia_g_signal(row, gex_data, walls_data):
                 f"Walls encavaladas (spread {wall_spread:.2%} < {G_MIN_WALL_SPREAD_PCT:.2%})"
             )
 
-        # Bônus: wall além do alvo (não barra o movimento antes de 0,50%)
+        # Bônus: wall além do alvo (não barra o movimento antes de 1,50%)
         if wall_ok and wall_dist >= G_TARGET_PCT:
             score += 10.0
             fatores.append("Wall além do alvo (caminho livre)")
@@ -1540,7 +1556,9 @@ def estrategia_g_signal(row, gex_data, walls_data):
         volume_z=volume_z,
         target_up=spot * (1 + G_TARGET_PCT),
         target_down=spot * (1 - G_TARGET_PCT),
+        trigger_pct=G_TARGET_PCT * 100.0,
         roe_net_est_pct=roe_liquido,
+        signal_time=row.get("close_time") if hasattr(row, "get") else None,
         gates_compra=gates_compra,
         gates_venda=gates_venda,
     )
@@ -2073,11 +2091,11 @@ with st.sidebar:
             "D — GEX + OI ATM + Expiração + Dual",
             "E — Brent/WTI + Sinal BTC",
             "F — GEX Walls / First Touch",
-            "G — GEX Expansion 0.50%",
+            "G — GEX Expansion 1.50%",
         ],
         key="cfg_estrategia",
         on_change=salvar_configuracoes,
-        help="A = score técnico; B = reversão; C = rompimento; D = GEX/OI/expiração; E = Brent/WTI; F = GEX Walls com primeiro toque; G = GEX Expansion com alvo BTC de 0,50%.",
+        help="A = score técnico; B = reversão; C = rompimento; D = GEX/OI/expiração; E = Brent/WTI; F = GEX Walls com primeiro toque; G = GEX Expansion com alvo BTC de 1,50%.",
     )
     automatizar_todas = st.checkbox(
         "🤖 Automatizar as 7 estratégias",
@@ -2131,12 +2149,32 @@ with st.sidebar:
         )
     if estrategia.startswith("G"):
         st.info(
-            "G transforma GEX, Gamma Flip, Put/Call Wall e Volume Z em variáveis relativas ao preço. Não reduz os indicadores por 10x: 10x só é usado para interpretar o alvo de 0,50% como ~5% sobre a margem. Entrada exige GEX de expansão, confirmação do Gamma Flip, Wall dentro de 0,50% e Volume Z >= 1."
+            "G usa GEX, Gamma Flip, Put/Call Wall e Volume Z. O gatilho de movimento é 1,50%; 10x só é referência de ROE (~15% sobre a margem antes de custos). Entrada exige GEX de expansão, Gamma Flip, Wall dentro de 1,50% e Volume Z >= 1. O Sniper a seco é o toque direto da Call/Put Wall."
         )
     if estrategia.startswith("E"):
         st.info(
             "E usa Brent/WTI como evento de contexto. A entrada só ocorre quando o Z-score entra em um novo extremo (|Z| >= 2,0), o BTC confirma COMPRA/VENDA e não existe uma entrada A igual no mesmo candle."
         )
+
+def buscar_operacao_g_relevante():
+    """Retorna a operação G aberta ou a última G registrada."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM trades
+            WHERE strategy = 'G'
+            ORDER BY CASE WHEN exit_time IS NULL THEN 0 ELSE 1 END, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in conn.execute("SELECT * FROM trades LIMIT 0").description]
+        return dict(zip(cols, row))
+    finally:
+        conn.close()
+
 
 # ============================================================
 # MONITORAMENTO
@@ -2181,6 +2219,9 @@ def monitor():
         sinal_g, motivo_g, fatores_g_compra, fatores_g_venda, score_g_compra, score_g_venda, g_detalhes = estrategia_g_signal(
             row, gex_data, f_walls
         )
+        if g_detalhes is not None:
+            g_detalhes["captured_price"] = float(row["Close"])
+            g_detalhes["signal_time_brt"] = signal_time.to_pydatetime().replace(tzinfo=timezone.utc).astimezone(ZoneInfo(F_BRASILIA_TZ)) if hasattr(signal_time, "to_pydatetime") else signal_time
 
         if estrategia.startswith("B"):
             strategy_code = "B"
@@ -2385,12 +2426,12 @@ def monitor():
                 elif low <= call_wall <= high and not (low <= put_wall <= high):
                     f_marcar_primeiro_toque("CALL WALL", signal_time)
 
-        # G — GEX Expansion: alvo fixo de +/-0,50% no BTC.
+        # G — GEX Expansion: alvo fixo de +/-1,50% no BTC.
         if "G" in estrategias_para_executar:
             if quantidade_abertas < int(max_operacoes) and sinal_g in ("COMPRA", "VENDA"):
                 if not entrada_ja_registrada(signal_time, strategy="G", side=sinal_g):
                     entrada = float(preco_atual)
-                    # Alvo de 0,50% e risco de 0,25%: R/R 1:2.
+                    # Alvo de 1,50% e risco de 0,75%: R/R 1:2.
                     distancia_alvo = entrada * G_TARGET_PCT
                     distancia_stop = distancia_alvo / 2.0
                     if sinal_g == "COMPRA":
@@ -2407,7 +2448,7 @@ def monitor():
                         imbalance=orderbook["imbalance"], score_compra=score_g_compra, score_venda=score_g_venda,
                         signal=sinal_g, entry_reason=motivo_g_entrada, strategy="G", cycle_id=None,
                         gex_data=gex_data, ratio_data=ratio_data,
-                        notes="Estratégia G — GEX Expansion 0,50%. Indicadores normalizados em relação ao preço; 10x é referência de execução/ROE, não escala dos indicadores. Alvo BTC +/-0,50%; stop 0,25%; R/R 1:2.",
+                        notes="Estratégia G — GEX Expansion 1,50%. Indicadores normalizados em relação ao preço; 10x é referência de execução/ROE, não escala dos indicadores. Alvo BTC +/-1,50%; stop 0,75%; R/R 1:2.",
                     )
                     entradas_realizadas.append(f"#{trade_id} G {sinal_g}")
                     quantidade_abertas += 1
@@ -2624,20 +2665,87 @@ def monitor():
                     elif sinal_f not in ("COMPRA", "VENDA"):
                         st.info("⏳ F aguardando o primeiro toque confirmado. Ainda não existe uma nova entrada operacional.")
             elif strategy_code == "G":
+                st.markdown("### ⚡ G — GEX Expansion 1,50%")
                 st.write(f"**Sinal G:** {sinal_g}")
                 st.caption(motivo_g)
-                if g_detalhes:
+
+                abertura_hoje, horario_abertura = obter_abertura_dia_brasilia(df)
+                operacao_g = buscar_operacao_g_relevante()
+                entrada_g = None
+                status_g = "SEM OPERAÇÃO G REGISTRADA"
+                if operacao_g is not None:
+                    try:
+                        entrada_g = float(operacao_g["entry_price"])
+                        status_g = (
+                            f"G ABERTA • #{int(operacao_g['id'])}" if not operacao_g.get("exit_time")
+                            else f"ÚLTIMA G ENCERRADA • #{int(operacao_g['id'])}"
+                        )
+                    except (TypeError, ValueError, KeyError):
+                        entrada_g = None
+
+                if g_detalhes and g_detalhes.get("status") == "OK":
+                    spot_g = float(g_detalhes["spot"])
+                    call_wall_g = float(g_detalhes["call_wall"])
+                    put_wall_g = float(g_detalhes["put_wall"])
+                    gamma_flip_g = float(g_detalhes["gamma_flip"])
+                    dist_call = (call_wall_g - spot_g) / spot_g
+                    dist_put = (spot_g - put_wall_g) / spot_g
+                    alvo_compra_g = spot_g * (1 + G_TARGET_PCT)
+                    alvo_venda_g = spot_g * (1 - G_TARGET_PCT)
+                    progresso_compra = max(0.0, min(100.0, abs((spot_g / (entrada_g if entrada_g else spot_g)) - 1.0) / G_TARGET_PCT * 100.0))
+                    candle_low = float(row["Low"])
+                    candle_high = float(row["High"])
+                    sniper_call = candle_low <= call_wall_g <= candle_high
+                    sniper_put = candle_low <= put_wall_g <= candle_high
+
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("₿ BTC atual", f"US$ {spot_g:,.2f}")
+                    c2.metric("📅 Abertura hoje (BRT)", f"US$ {abertura_hoje:,.2f}" if abertura_hoje is not None else "N/D")
+                    c3.metric("🎯 Preço capturado", f"US$ {entrada_g:,.2f}" if entrada_g is not None else f"US$ {spot_g:,.2f}")
+
+                    if entrada_g is not None:
+                        variacao_entrada = (spot_g / entrada_g - 1.0) * 100.0
+                        st.caption(f"Variação desde a entrada G: {variacao_entrada:+.2f}% • {status_g}")
+                    elif horario_abertura is not None:
+                        st.caption(f"Abertura do dia: {horario_abertura.strftime('%d/%m/%Y %H:%M')} BRT")
+
+                    st.markdown("**Gatilho de movimento**")
+                    g1, g2, g3, g4 = st.columns(4)
+                    g1.metric("Mínimo", f"{G_TARGET_PCT*100:.2f}%")
+                    g2.metric("Alvo COMPRA", f"US$ {alvo_compra_g:,.2f}")
+                    g3.metric("Alvo VENDA", f"US$ {alvo_venda_g:,.2f}")
+                    g4.metric("ROE teórico 10x", f"±{G_TARGET_PCT*100*10:.1f}%")
+
+                    st.markdown("**GEX Walls / Sniper no toque**")
+                    w1, w2, w3 = st.columns(3)
+                    w1.metric("📍 Call Wall", f"US$ {call_wall_g:,.0f}", f"{dist_call:+.2f}%")
+                    w2.metric("📍 Put Wall", f"US$ {put_wall_g:,.0f}", f"{dist_put:+.2f}%")
+                    w3.metric("Gamma Flip", f"US$ {gamma_flip_g:,.0f}", f"{g_detalhes.get('gamma_flip_dist_pct', 0):+.2f}%")
+
+                    st.write(
+                        f"**Sniper Call a seco:** {'🎯 TOQUE' if sniper_call else '⏳ AGUARDANDO TOQUE'} | "
+                        f"**Sniper Put a seco:** {'🎯 TOQUE' if sniper_put else '⏳ AGUARDANDO TOQUE'}"
+                    )
+
+                    st.markdown("**Diagnóstico dos gatilhos**")
+                    gates_c = g_detalhes.get("gates_compra", {})
+                    gates_v = g_detalhes.get("gates_venda", {})
+                    diag = pd.DataFrame([
+                        ["GEX expansão", "✅" if gates_c.get("GEX") else "❌", "✅" if gates_v.get("GEX") else "❌"],
+                        ["Gamma Flip", "✅" if gates_c.get("Flip") else "❌", "✅" if gates_v.get("Flip") else "❌"],
+                        ["Wall", "✅" if gates_c.get("Wall") else "❌", "✅" if gates_v.get("Wall") else "❌"],
+                        ["Volume Z", "✅" if gates_c.get("Volume") else "❌", "✅" if gates_v.get("Volume") else "❌"],
+                        ["Spread Walls", "✅" if gates_c.get("Spread") else "❌", "✅" if gates_v.get("Spread") else "❌"],
+                    ], columns=["Critério", "COMPRA", "VENDA"])
+                    st.dataframe(diag, hide_index=True, use_container_width=True)
+
                     st.write(
                         f"**GEX norm.:** {g_detalhes.get('gex_norm', 0):+.2f} | "
-                        f"**Gamma Flip:** {g_detalhes.get('gamma_flip_dist_pct', 0):+.2f}% | "
-                        f"**Put Wall:** {g_detalhes.get('put_wall_dist_pct', 0):+.2f}% | "
-                        f"**Call Wall:** {g_detalhes.get('call_wall_dist_pct', 0):+.2f}% | "
-                        f"**Volume Z:** {g_detalhes.get('volume_z', 0):+.2f}"
+                        f"**Volume Z:** {g_detalhes.get('volume_z', 0):+.2f} | "
+                        f"**Score:** COMPRA {score_g_compra:.0f} | VENDA {score_g_venda:.0f}"
                     )
-                    st.write(
-                        f"**Score G:** COMPRA {score_g_compra:.0f} | VENDA {score_g_venda:.0f} | "
-                        f"**Alvo BTC:** ±{G_TARGET_PCT*100:.2f}% | **ROE teórico em 10x:** ±{G_TARGET_PCT*100*10:.1f}%"
-                    )
+                else:
+                    st.warning("G aguardando dados suficientes de GEX/Walls para montar o painel operacional.")
             sinal_plano = sinal_operacional if sinal_operacional in ("COMPRA", "VENDA") else (sinal if sinal in ("COMPRA", "VENDA") else None)
             if sinal_plano and strategy_code != "F":
                 if strategy_code == "G":
@@ -2685,7 +2793,7 @@ def monitor():
                     st.success("🟢 Estratégia D ATIVA")
                 else:
                     st.info("⚪ Estratégia D INATIVA")
-                st.markdown("**G — GEX Expansion 0,50%**")
+                st.markdown("**G — GEX Expansion 1,50%**")
                 gg1, gg2, gg3 = st.columns(3)
                 gg1.metric("Score G COMPRA", f"{score_g_compra:.0f}")
                 gg2.metric("Score G VENDA", f"{score_g_venda:.0f}")
